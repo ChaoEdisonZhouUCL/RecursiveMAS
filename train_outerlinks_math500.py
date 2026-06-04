@@ -426,18 +426,17 @@ def latent_rollout(
     attention_mask: torch.Tensor,
     latent_steps: int,
     dtype: torch.dtype,
+    agent_idx: int = 0,
+    shared_link: Optional["SharedRecursiveLink"] = None,
 ) -> torch.Tensor:
     """
     Run `latent_steps` steps of inner-adapter auto-regression in latent space.
     Returns concatenated last-layer hidden states: (1, latent_steps, d_model).
 
-    Uses a forward hook on the final transformer layer to capture only the
-    last-position hidden state — avoids allocating all intermediate hidden
-    states that output_hidden_states=True would return.
-    KV-cache is used for O(1) per-step cost; cache is detached between steps
-    so it never forms cycles in the autograd graph.
+    When shared_link is provided (shared_roae mode), the inner self-loop uses
+    SharedRecursiveLink(h, src=agent_idx, dst=agent_idx) instead of inner_adapter.
+    agent_idx is 1-indexed (1=Planner, 2=Critic, 3=Solver).
     """
-    # Install a hook on the last layer to capture its output's last position.
     _last_h: list = []
 
     def _hook(module, inp, out):
@@ -470,7 +469,11 @@ def latent_rollout(
             past_key_values = _detach_past_key_values(out.past_key_values)
             am = torch.cat([am, am.new_ones((am.size(0), 1))], dim=1)
             with torch.no_grad():
-                ie = inner_adapter(last_h.detach()).unsqueeze(1).to(dtype)
+                if shared_link is not None:
+                    # Inner self-loop: same agent speaks to itself.
+                    ie = shared_link(last_h.detach().unsqueeze(1), src=agent_idx, dst=agent_idx).to(dtype)
+                else:
+                    ie = inner_adapter(last_h.detach()).unsqueeze(1).to(dtype)
     finally:
         handle.remove()
 
@@ -577,7 +580,8 @@ def forward_one_round(
             planner_tok, planner_mdl.get_input_embeddings(),
             pre, post, feedback_prefix, device, dtype,
         )
-        planner_h = latent_rollout(planner_mdl, planner_inner, ie, am, latent_steps, dtype)
+        planner_h = latent_rollout(planner_mdl, planner_inner, ie, am, latent_steps, dtype,
+                                   agent_idx=1, shared_link=shared_link)
         if shared_link is not None:
             critic_prefix = shared_link(planner_h, src=1, dst=2)
         else:
@@ -601,7 +605,8 @@ def forward_one_round(
             critic_tok, critic_mdl.get_input_embeddings(),
             pre_c, post_c, critic_prefix, device, dtype,
         )
-        critic_h = latent_rollout(critic_mdl, critic_inner, critic_input, critic_am, latent_steps, dtype)
+        critic_h = latent_rollout(critic_mdl, critic_inner, critic_input, critic_am, latent_steps, dtype,
+                                  agent_idx=2, shared_link=shared_link)
         if shared_link is not None:
             solver_prefix = shared_link(critic_h, src=2, dst=3)
         else:
@@ -623,15 +628,30 @@ def forward_one_round(
             solver_tok, solver_mdl.get_input_embeddings(),
             pre_s, post_s, solver_prefix, device, dtype,
         )
-        solver_h = latent_rollout(solver_mdl, solver_inner, solver_input, solver_am, latent_steps, dtype)
+        solver_h = latent_rollout(solver_mdl, solver_inner, solver_input, solver_am, latent_steps, dtype,
+                                  agent_idx=3, shared_link=shared_link)
         if shared_link is not None:
             feedback = shared_link(solver_h, src=3, dst=1)
         else:
             feedback = outer_31(solver_h)
-        lm_head          = solver_mdl.lm_head
-        solver_logits    = lm_head(solver_prefix.to(lm_head.weight.dtype))
+        # Teacher-forced CE against ground-truth answer y (paper Eq.6).
+        # Append answer token embeddings to the solver's context and run one
+        # forward pass; logits over the answer positions are the CE targets.
         solver_input_ids = solver_tok(answer, return_tensors="pt",
                                       add_special_tokens=False).to(device)["input_ids"]
+        embed_fn = solver_mdl.get_input_embeddings()
+        with torch.no_grad():
+            answer_embeds = embed_fn(solver_input_ids).to(dtype)   # (1, A, d)
+        # Concatenate: [prompt + latent context] then [answer tokens].
+        # The model sees the full context; we only supervise the answer positions.
+        tf_embeds = torch.cat([solver_input, answer_embeds], dim=1)
+        tf_am     = torch.cat([solver_am,
+                               solver_am.new_ones((1, answer_embeds.size(1)))], dim=1)
+        tf_out    = solver_mdl(inputs_embeds=tf_embeds, attention_mask=tf_am,
+                               return_dict=True)
+        # Logits aligned to answer tokens: the last A positions of the output.
+        A             = solver_input_ids.size(1)
+        solver_logits = tf_out.logits[:, -A:, :]   # (1, A, vocab)
         out["feedback"]         = feedback
         out["solver_logits"]    = solver_logits
         out["solver_input_ids"] = solver_input_ids
@@ -663,20 +683,23 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     if rank == rp:
         if rank == 0: print("Loading Planner...")
         planner_mdl, planner_tok = load_model_and_tokenizer(PLANNER_REPO, device, dtype)
-        planner_inner = load_inner_adapter(PLANNER_REPO, PLANNER_DIM, device, dtype)
-        for p in planner_inner.parameters(): p.requires_grad_(False)
+        if mode != "shared_roae":
+            planner_inner = load_inner_adapter(PLANNER_REPO, PLANNER_DIM, device, dtype)
+            for p in planner_inner.parameters(): p.requires_grad_(False)
 
     if rank == rc:
         if rank == 0: print("Loading Critic...")
         critic_mdl, critic_tok = load_model_and_tokenizer(CRITIC_REPO, device, dtype)
-        critic_inner = load_inner_adapter(CRITIC_REPO, CRITIC_DIM, device, dtype)
-        for p in critic_inner.parameters(): p.requires_grad_(False)
+        if mode != "shared_roae":
+            critic_inner = load_inner_adapter(CRITIC_REPO, CRITIC_DIM, device, dtype)
+            for p in critic_inner.parameters(): p.requires_grad_(False)
 
     if rank == rs:
         if rank == 0: print("Loading Solver...")
         solver_mdl, solver_tok = load_model_and_tokenizer(SOLVER_REPO, device, dtype)
-        solver_inner = load_inner_adapter(SOLVER_REPO, SOLVER_DIM, device, dtype)
-        for p in solver_inner.parameters(): p.requires_grad_(False)
+        if mode != "shared_roae":
+            solver_inner = load_inner_adapter(SOLVER_REPO, SOLVER_DIM, device, dtype)
+            for p in solver_inner.parameters(): p.requires_grad_(False)
 
     _barrier()
 
@@ -808,13 +831,13 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                 solver_logits    = last["solver_logits"]
                 solver_input_ids = last["solver_input_ids"]
                 if solver_logits is not None:
-                    L = solver_logits.size(1)
-                    A = solver_input_ids.size(1)
-                    n = min(L, A)
-                    if n > 0:
+                    # solver_logits: (1, A, vocab) over the A answer positions.
+                    # Standard next-token shift: logit[t] predicts target[t+1].
+                    # So we use logits[:-1] vs targets[1:], giving A-1 pairs.
+                    if solver_logits.size(1) > 1:
                         loss = F.cross_entropy(
-                            solver_logits[:, :n].reshape(-1, solver_logits.size(-1)),
-                            solver_input_ids[:, :n].reshape(-1),
+                            solver_logits[:, :-1].reshape(-1, solver_logits.size(-1)),
+                            solver_input_ids[:, 1:].reshape(-1),
                         ) / cfg.batch_size
 
             # ── Backward: explicit, barrier-separated pipeline grad exchange ──
