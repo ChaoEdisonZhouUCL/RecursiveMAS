@@ -162,17 +162,14 @@ class SharedRecursiveLink(nn.Module):
         # Direct skip in native hidden space for gradient highway.
         self.skip_proj = nn.ModuleList([
             nn.ModuleList([
-                nn.Identity() if hidden_dims[i] == hidden_dims[j]
-                else nn.Linear(hidden_dims[i], hidden_dims[j], bias=False)
+                nn.Linear(hidden_dims[i], hidden_dims[j], bias=False)
                 for j in range(N)
             ])
             for i in range(N)
         ])
         for i in range(N):
             for j in range(N):
-                m = self.skip_proj[i][j]
-                if isinstance(m, nn.Linear):
-                    nn.init.orthogonal_(m.weight)
+                nn.init.orthogonal_(self.skip_proj[i][j].weight)
 
         self.router   = nn.Linear(3 * d, n_experts, bias=False)
         exp_hidden = max(1, d // expert_dim_divisor)
@@ -541,6 +538,7 @@ def forward_one_round(
     outer_23: Optional[CrossModelAdapter],
     outer_31: Optional[CrossModelAdapter],
     question: str,
+    answer: str,
     feedback_prefix: Optional[torch.Tensor],
     latent_steps: int,
     device: torch.device,
@@ -632,7 +630,7 @@ def forward_one_round(
             feedback = outer_31(solver_h)
         lm_head          = solver_mdl.lm_head
         solver_logits    = lm_head(solver_prefix.to(lm_head.weight.dtype))
-        solver_input_ids = solver_tok(post_s, return_tensors="pt",
+        solver_input_ids = solver_tok(answer, return_tensors="pt",
                                       add_special_tokens=False).to(device)["input_ids"]
         out["feedback"]         = feedback
         out["solver_logits"]    = solver_logits
@@ -754,7 +752,7 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
         print(f"{'='*70}")
 
     for step in range(cfg.steps):
-        question, _ = problems[rng.integers(len(problems))]
+        question, answer = problems[rng.integers(len(problems))]
 
         # ── Forward: all n rounds (paper Eq.6: L_out = CE(S^n(...S^1(x)), y)) ─
         # Each rank runs only its own agent.  Cross-rank data is sent/recv'd as
@@ -772,6 +770,7 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                 solver_mdl,  solver_tok,  solver_inner,
                 outer_12, outer_23, outer_31,
                 question=question,
+                answer=answer,
                 feedback_prefix=feedback_prefix,
                 latent_steps=cfg.latent_steps,
                 device=device,
