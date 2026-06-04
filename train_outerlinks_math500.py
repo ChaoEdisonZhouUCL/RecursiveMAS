@@ -91,16 +91,13 @@ def _barrier():
     if _is_dist():
         dist.barrier()
 
-# Separate gloo process group used exclusively for point-to-point tensor
-# transfers.  This keeps p2p traffic off the NCCL communicator so that
-# dist.send/recv calls never interleave with NCCL barriers/broadcasts and
-# cause sequence-number mismatches.
-_GLOO_GROUP = None
+# ── P2P communication ─────────────────────────────────────────────────────────
+# Use NCCL directly for GPU-to-GPU tensor transfers (fast path).
+# Gloo group kept as fallback for shape-protocol exchanges only.
+_GLOO_GROUP = None  # kept for API compatibility; no longer used for data transfers
 
 def _init_gloo_group():
-    global _GLOO_GROUP
-    if _is_dist() and _GLOO_GROUP is None:
-        _GLOO_GROUP = dist.new_group(backend="gloo")
+    pass  # P2P now uses NCCL directly; no separate gloo group needed
 
 
 # ── Shared-Link with Rotary Agent Encoding (RoAE) ────────────────────────────
@@ -255,32 +252,20 @@ def _owns(agent: str) -> bool:
 # backward on rank 0 or 1.
 
 def _send_tensor(t: torch.Tensor, dst: int):
-    """Send shape + data to dst via gloo (CPU float32), independent of NCCL."""
-    assert _GLOO_GROUP is not None, "_send_tensor called before _init_gloo_group"
-    data = t.detach().cpu().contiguous().float()   # float32 on CPU
-    # Send ndim, then shape as individual int32 scalars, then data.
-    ndim = torch.tensor([data.ndim], dtype=torch.int32)
-    dist.send(ndim, dst=dst, group=_GLOO_GROUP)
-    for s in data.shape:
-        dist.send(torch.tensor([s], dtype=torch.int32), dst=dst, group=_GLOO_GROUP)
-    dist.send(data, dst=dst, group=_GLOO_GROUP)
+    """Send tensor to dst via NCCL (GPU direct, no CPU round-trip)."""
+    data = t.detach().contiguous()
+    dist.send(data, dst=dst)
 
 
 def _recv_tensor(src: int, device: torch.device, dtype: torch.dtype,
-                 requires_grad: bool = False) -> torch.Tensor:
-    """Receive shape + data from src via gloo; returns tensor on device with dtype."""
-    assert _GLOO_GROUP is not None, "_recv_tensor called before _init_gloo_group"
-    ndim_buf = torch.zeros(1, dtype=torch.int32)
-    dist.recv(ndim_buf, src=src, group=_GLOO_GROUP)
-    ndim = ndim_buf.item()
-    shape = []
-    for _ in range(int(ndim)):
-        s_buf = torch.zeros(1, dtype=torch.int32)
-        dist.recv(s_buf, src=src, group=_GLOO_GROUP)
-        shape.append(s_buf.item())
-    buf = torch.zeros(shape, dtype=torch.float32)  # float32 on CPU
-    dist.recv(buf, src=src, group=_GLOO_GROUP)
-    return buf.to(device=device, dtype=dtype).requires_grad_(requires_grad)
+                 requires_grad: bool = False, shape: Optional[tuple] = None) -> torch.Tensor:
+    """Receive tensor from src via NCCL. shape must be known by the receiver."""
+    assert shape is not None, "_recv_tensor requires explicit shape with NCCL"
+    buf = torch.empty(shape, dtype=dtype, device=device)
+    dist.recv(buf, src=src)
+    if requires_grad:
+        buf = buf.requires_grad_(True)
+    return buf
 
 
 # ── Model loading helpers ────────────────────────────────────────────────────
@@ -354,36 +339,56 @@ def load_math500(n_samples: int = 0, seed: int = 42):
     return [(row["problem"], row["answer"]) for row in ds]
 
 
-def build_planner_prompt(question: str) -> str:
-    return (
-        "You are a planner agent in a recursive multi-agent system. "
-        "Here is the latent information from previous round:\n"
-        "{Latent Thought Embeddings}. "
-        "Given the latent information, you should output a step-by-step plan "
-        f"to solve the question: {question}"
-    )
+def build_planner_prompt(question: str) -> Tuple[str, str]:
+    """Returns (prefix, suffix) around the latent embedding slot."""
+    pre  = "You are a planner agent in a recursive multi-agent system. Here is the latent information from previous round:\n"
+    post = f"Given the latent information, you should output a step-by-step plan to solve the question: {question}"
+    return pre, post
 
 
-def build_critic_prompt(question: str) -> str:
-    return (
-        "You are a critic agent in a recursive multi-agent system. "
-        "Here is the latent information from previous agent:\n"
-        "{Latent Thought Embeddings}. "
-        "Given the latent information, you should critique the initial plan "
-        "and output an improved plan to solve the question: "
-        f"{question}"
-    )
+def build_critic_prompt(question: str) -> Tuple[str, str]:
+    pre  = "You are a critic agent in a recursive multi-agent system. Here is the latent information from previous agent:\n"
+    post = f"Given the latent information, you should critique the initial plan and output an improved plan to solve the question: {question}"
+    return pre, post
 
 
-def build_solver_prompt(question: str) -> str:
-    return (
-        "You are a solver agent in a recursive multi-agent system. "
-        "Here is the latent information from previous agent:\n"
-        "{Latent Thought Embeddings} "
-        "Given the latent information, you should solve the question and "
-        f"provide the final answer: {question}\n"
-        "Solve the question and put the final answer inside \\boxed{}."
-    )
+def build_solver_prompt(question: str) -> Tuple[str, str]:
+    pre  = "You are a solver agent in a recursive multi-agent system. Here is the latent information from previous agent:\n"
+    post = (f"Given the latent information, you should solve the question and provide the final answer: {question}\n"
+            "Solve the question and put the final answer inside \\boxed{}.")
+    return pre, post
+
+
+def _build_input_embeds(tokenizer, embed_fn, pre: str, post: str,
+                        latent: Optional[torch.Tensor],
+                        device: torch.device, dtype: torch.dtype):
+    """
+    Build input_embeds and attention_mask by injecting `latent` between the
+    tokenized `pre` and `post` strings — matching the paper's prompt template:
+        [pre tokens] [latent embeddings] [post tokens]
+
+    When latent is None (first round, no prior agent), only [pre + post] is used.
+    """
+    enc_pre  = tokenizer(pre,  return_tensors="pt", add_special_tokens=True).to(device)
+    enc_post = tokenizer(post, return_tensors="pt", add_special_tokens=False).to(device)
+
+    with torch.no_grad():
+        emb_pre  = embed_fn(enc_pre["input_ids"]).to(dtype)   # (1, T_pre, d)
+        emb_post = embed_fn(enc_post["input_ids"]).to(dtype)  # (1, T_post, d)
+
+    if latent is not None:
+        lat = latent.to(dtype)                                 # (1, T_lat, d)
+        ie  = torch.cat([emb_pre, lat, emb_post], dim=1)
+        am  = torch.cat([
+            enc_pre["attention_mask"],
+            enc_pre["attention_mask"].new_ones((1, lat.size(1))),
+            enc_post["attention_mask"],
+        ], dim=1)
+    else:
+        ie = torch.cat([emb_pre, emb_post], dim=1)
+        am = torch.cat([enc_pre["attention_mask"], enc_post["attention_mask"]], dim=1)
+
+    return ie, am
 
 
 # ── Latent rollout ────────────────────────────────────────────────────────────
@@ -406,6 +411,17 @@ def _detach_past_key_values(pkv):
     return pkv
 
 
+def _get_last_layer(model) -> torch.nn.Module:
+    """Return the final transformer layer so we can hook it instead of collecting all hidden states."""
+    # Works for LlamaModel, Qwen2Model, and most HF decoder models.
+    inner = getattr(model, "model", model)
+    layers = getattr(inner, "layers", None)
+    if layers is not None:
+        return layers[-1]
+    # Fallback: return the norm — hook will fire after last layer.
+    return getattr(inner, "norm", model)
+
+
 def latent_rollout(
     model,
     inner_adapter,
@@ -415,44 +431,51 @@ def latent_rollout(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """
-    Run `latent_steps` steps of inner-adapter auto-regression.
-    Returns concatenated hidden states: (1, latent_steps, d_model).
+    Run `latent_steps` steps of inner-adapter auto-regression in latent space.
+    Returns concatenated last-layer hidden states: (1, latent_steps, d_model).
 
-    Backbone runs WITHOUT torch.no_grad() so activations are differentiable
-    w.r.t. the outer-link prefix in input_embeds.  Backbone weights are frozen
-    (requires_grad=False) so they accumulate no .grad.
-    Inner adapter steps run under no_grad (frozen, constant Jacobian).
+    Uses a forward hook on the final transformer layer to capture only the
+    last-position hidden state — avoids allocating all intermediate hidden
+    states that output_hidden_states=True would return.
+    KV-cache is used for O(1) per-step cost; cache is detached between steps
+    so it never forms cycles in the autograd graph.
     """
+    # Install a hook on the last layer to capture its output's last position.
+    _last_h: list = []
+
+    def _hook(module, inp, out):
+        h = out[0] if isinstance(out, tuple) else out   # (B, T, d)
+        _last_h.append(h[:, -1, :])                     # (B, d)
+
+    last_layer = _get_last_layer(model)
+    handle = last_layer.register_forward_hook(_hook)
+
     hidden_states = []
     past_key_values = None
     ie = input_embeds
     am = attention_mask
-    for step in range(latent_steps):
-        try:
-            out = model(inputs_embeds=ie, attention_mask=am,
-                        output_hidden_states=True, use_cache=True,
-                        past_key_values=past_key_values,
-                        return_dict=True, logits_to_keep=1)
-        except TypeError:
-            out = model(inputs_embeds=ie, attention_mask=am,
-                        output_hidden_states=True, use_cache=True,
-                        past_key_values=past_key_values,
-                        return_dict=True)
+    try:
+        for _ in range(latent_steps):
+            _last_h.clear()
+            try:
+                out = model(inputs_embeds=ie, attention_mask=am,
+                            use_cache=True, past_key_values=past_key_values,
+                            return_dict=True, logits_to_keep=1)
+            except TypeError:
+                out = model(inputs_embeds=ie, attention_mask=am,
+                            use_cache=True, past_key_values=past_key_values,
+                            return_dict=True)
 
-        last_h = out.hidden_states[-1][:, -1, :]   # (1, d)
-        hidden_states.append(last_h.unsqueeze(1))
+            last_h = _last_h[0]                         # (1, d) — in autograd graph
+            hidden_states.append(last_h.unsqueeze(1))
 
-        # Detach the KV-cache before passing it to the next step so that
-        # cached key/value tensors never form a cycle in the autograd graph.
-        # Backbone weights are frozen (requires_grad=False) so no gradient
-        # flows through past_key_values anyway; detaching is safe and prevents
-        # graph entanglement that caused the distributed deadlock.
-        past_key_values = _detach_past_key_values(out.past_key_values)
-        am = torch.cat([am, am.new_ones((am.size(0), 1))], dim=1)
-
-        with torch.no_grad():
-            next_emb = inner_adapter(last_h.detach()).unsqueeze(1).to(dtype)
-        ie = next_emb   # only the new token; cache handles prior context
+            # Detach cache to prevent autograd graph cycles across steps.
+            past_key_values = _detach_past_key_values(out.past_key_values)
+            am = torch.cat([am, am.new_ones((am.size(0), 1))], dim=1)
+            with torch.no_grad():
+                ie = inner_adapter(last_h.detach()).unsqueeze(1).to(dtype)
+    finally:
+        handle.remove()
 
     return torch.cat(hidden_states, dim=1)   # (1, latent_steps, d)
 
@@ -551,18 +574,11 @@ def forward_one_round(
 
     # ── Stage 1: Planner computes critic_prefix, sends to Critic ─────────────
     if rank == rp:
-        embed = planner_mdl.get_input_embeddings()
-        enc   = planner_tok(build_planner_prompt(question), return_tensors="pt").to(device)
-        with torch.no_grad():
-            base_embeds = embed(enc["input_ids"]).to(dtype)
-        if feedback_prefix is not None:
-            ie = torch.cat([feedback_prefix.to(dtype), base_embeds], dim=1)
-            am = torch.cat([
-                enc["attention_mask"].new_ones((1, feedback_prefix.size(1))),
-                enc["attention_mask"],
-            ], dim=1)
-        else:
-            ie, am = base_embeds, enc["attention_mask"]
+        pre, post = build_planner_prompt(question)
+        ie, am = _build_input_embeds(
+            planner_tok, planner_mdl.get_input_embeddings(),
+            pre, post, feedback_prefix, device, dtype,
+        )
         planner_h = latent_rollout(planner_mdl, planner_inner, ie, am, latent_steps, dtype)
         if shared_link is not None:
             critic_prefix = shared_link(planner_h, src=1, dst=2)
@@ -575,21 +591,18 @@ def forward_one_round(
             _send_tensor(critic_prefix, dst=rc)
 
     if pipeline and rp != rc and rank == rc:
-        cp_recv = _recv_tensor(src=rp, device=device, dtype=dtype, requires_grad=True)
+        cp_recv = _recv_tensor(src=rp, device=device, dtype=dtype, requires_grad=True,
+                               shape=(1, latent_steps, CRITIC_DIM))
         out["cp_recv"] = cp_recv
         critic_prefix  = cp_recv
 
     # ── Stage 2: Critic computes solver_prefix, sends to Solver ──────────────
     if rank == rc:
-        critic_embed = critic_mdl.get_input_embeddings()
-        enc_c        = critic_tok(build_critic_prompt(question), return_tensors="pt").to(device)
-        with torch.no_grad():
-            critic_base = critic_embed(enc_c["input_ids"]).to(dtype)
-        critic_input = torch.cat([critic_prefix, critic_base], dim=1)
-        critic_am    = torch.cat([
-            enc_c["attention_mask"].new_ones((1, critic_prefix.size(1))),
-            enc_c["attention_mask"],
-        ], dim=1)
+        pre_c, post_c = build_critic_prompt(question)
+        critic_input, critic_am = _build_input_embeds(
+            critic_tok, critic_mdl.get_input_embeddings(),
+            pre_c, post_c, critic_prefix, device, dtype,
+        )
         critic_h = latent_rollout(critic_mdl, critic_inner, critic_input, critic_am, latent_steps, dtype)
         if shared_link is not None:
             solver_prefix = shared_link(critic_h, src=2, dst=3)
@@ -600,21 +613,18 @@ def forward_one_round(
             _send_tensor(solver_prefix, dst=rs)
 
     if pipeline and rc != rs and rank == rs:
-        sp_recv = _recv_tensor(src=rc, device=device, dtype=dtype, requires_grad=True)
+        sp_recv = _recv_tensor(src=rc, device=device, dtype=dtype, requires_grad=True,
+                               shape=(1, latent_steps, SOLVER_DIM))
         out["sp_recv"] = sp_recv
         solver_prefix  = sp_recv
 
     # ── Stage 3: Solver runs, produces feedback and logits ───────────────────
     if rank == rs:
-        solver_embed    = solver_mdl.get_input_embeddings()
-        enc_s           = solver_tok(build_solver_prompt(question), return_tensors="pt").to(device)
-        with torch.no_grad():
-            solver_base = solver_embed(enc_s["input_ids"]).to(dtype)
-        solver_input    = torch.cat([solver_prefix, solver_base], dim=1)
-        solver_am       = torch.cat([
-            enc_s["attention_mask"].new_ones((1, solver_prefix.size(1))),
-            enc_s["attention_mask"],
-        ], dim=1)
+        pre_s, post_s = build_solver_prompt(question)
+        solver_input, solver_am = _build_input_embeds(
+            solver_tok, solver_mdl.get_input_embeddings(),
+            pre_s, post_s, solver_prefix, device, dtype,
+        )
         solver_h = latent_rollout(solver_mdl, solver_inner, solver_input, solver_am, latent_steps, dtype)
         if shared_link is not None:
             feedback = shared_link(solver_h, src=3, dst=1)
@@ -622,7 +632,8 @@ def forward_one_round(
             feedback = outer_31(solver_h)
         lm_head          = solver_mdl.lm_head
         solver_logits    = lm_head(solver_prefix.to(lm_head.weight.dtype))
-        solver_input_ids = enc_s["input_ids"]
+        solver_input_ids = solver_tok(post_s, return_tensors="pt",
+                                      add_special_tokens=False).to(device)["input_ids"]
         out["feedback"]         = feedback
         out["solver_logits"]    = solver_logits
         out["solver_input_ids"] = solver_input_ids
@@ -677,9 +688,8 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     shared_link = None
 
     if mode == "shared_roae":
-        # One SharedRecursiveLink on every rank; gradients allreduced after backward.
         hidden_dims = [PLANNER_DIM, CRITIC_DIM, SOLVER_DIM]
-        shared_dim  = max(hidden_dims)
+        shared_dim  = 512
         shared_link = SharedRecursiveLink(
             hidden_dims=hidden_dims,
             shared_dim=shared_dim,
@@ -780,7 +790,8 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                         _send_tensor(out["feedback"], dst=rp)
                     if rank == rp:
                         feedback_prefix = _recv_tensor(src=rs, device=device, dtype=dtype,
-                                                       requires_grad=True)
+                                                       requires_grad=True,
+                                                       shape=(1, cfg.latent_steps, PLANNER_DIM))
                         out["fb_recv"] = feedback_prefix
                 else:
                     feedback_prefix = out.get("feedback")
@@ -834,75 +845,74 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                 o = rounds[r]
 
                 # Step A ── rs: backward through local graph ───────────────────
+                # No barrier needed: rs acts alone, B/C P2P below synchronise.
                 if rank == rs:
                     if r == cfg.n_rounds - 1:
                         if loss is not None:
                             loss.backward()
                     else:
-                        # g_fb was received in Step D of the previous backward iteration (round r+1)
                         g_fb = rounds[r + 1].get("g_fb_for_prev")
                         fb   = o.get("feedback")
                         if fb is not None and g_fb is not None:
                             fb.backward(g_fb)
 
-                _barrier()
-
-                # Step B ── rs→rc grad for solver_prefix ──────────────────────
+                # Step B ── rs→rc grad (P2P synchronises rs and rc; rp idles) ─
                 if rank == rs:
                     sp_recv = o.get("sp_recv")
-                    if sp_recv is not None:
-                        g = sp_recv.grad if sp_recv.grad is not None else torch.zeros_like(sp_recv)
-                        _send_tensor(g, dst=rc)
+                    g = sp_recv.grad if (sp_recv is not None and sp_recv.grad is not None) \
+                        else torch.zeros((1, cfg.latent_steps, SOLVER_DIM), dtype=dtype, device=device)
+                    _send_tensor(g, dst=rc)
 
                 if rank == rc:
                     sv_pfx = o.get("solver_prefix_rc")
+                    g = _recv_tensor(src=rs, device=device, dtype=dtype,
+                                     shape=(1, cfg.latent_steps, SOLVER_DIM))
                     if sv_pfx is not None:
-                        g = _recv_tensor(src=rs, device=device, dtype=dtype)
                         sv_pfx.backward(g)
 
-                _barrier()
-
-                # Step C ── rc→rp grad for critic_prefix ──────────────────────
+                # Step C ── rc→rp grad (P2P synchronises rc and rp; rs idles) ─
                 if rank == rc:
                     cp_recv = o.get("cp_recv")
-                    if cp_recv is not None:
-                        _send_tensor(cp_recv.grad if cp_recv.grad is not None
-                                     else torch.zeros_like(cp_recv), dst=rp)
+                    g = cp_recv.grad if (cp_recv is not None and cp_recv.grad is not None) \
+                        else torch.zeros((1, cfg.latent_steps, CRITIC_DIM), dtype=dtype, device=device)
+                    _send_tensor(g, dst=rp)
 
                 if rank == rp:
                     cr_pfx = o.get("critic_prefix")
+                    g = _recv_tensor(src=rc, device=device, dtype=dtype,
+                                     shape=(1, cfg.latent_steps, CRITIC_DIM))
                     if cr_pfx is not None:
-                        g = _recv_tensor(src=rc, device=device, dtype=dtype)
                         cr_pfx.backward(g)
 
-                _barrier()
+                # Step D ── rp→rs feedback grad (only when r>0) ───────────────
+                # Both sides execute before the loop's next iteration; no barrier needed.
+                if r > 0 and pipeline and rs != rp:
+                    if rank == rp:
+                        fb_recv = rounds[r - 1].get("fb_recv")
+                        g = fb_recv.grad if (fb_recv is not None and fb_recv.grad is not None) \
+                            else torch.zeros((1, cfg.latent_steps, PLANNER_DIM), dtype=dtype, device=device)
+                        _send_tensor(g, dst=rs)
+                    if rank == rs:
+                        o["g_fb_for_prev"] = _recv_tensor(src=rp, device=device, dtype=dtype,
+                                                          shape=(1, cfg.latent_steps, PLANNER_DIM))
 
-                # Step D ── rp sends fb_recv.grad to rs; rs recvs it here (not deferred).
-                # fb_recv is rounds[r-1]["fb_recv"]: the feedback tensor used as input
-                # to forward round r, received by rp from rs after forward round r-1.
-                if r > 0:
-                    if pipeline and rs != rp:
-                        if rank == rp:
-                            fb_recv = rounds[r - 1].get("fb_recv")
-                            g = fb_recv.grad if (fb_recv is not None and fb_recv.grad is not None) \
-                                else torch.zeros_like(fb_recv) if fb_recv is not None \
-                                else torch.zeros(1, dtype=dtype, device=device)
-                            _send_tensor(g, dst=rs)
-                        if rank == rs:
-                            # Store for use in Step A of the next backward iteration (round r-1)
-                            o["g_fb_for_prev"] = _recv_tensor(src=rp, device=device, dtype=dtype)
-                    _barrier()   # ALL ranks sync
-
+        # One barrier after all backward rounds to sync before optimizer step.
         _barrier()
 
-        # In shared_roae mode every rank computed a different subset of transitions
-        # and therefore accumulated gradients for a different subset of input/output
-        # tokens.  Allreduce brings all ranks to the same gradient before the step.
+        # Flattened allreduce for SharedRecursiveLink: pack all grads into one
+        # buffer, allreduce once, unpack. Much cheaper than per-parameter calls.
         if _is_dist() and shared_link is not None:
-            for p in shared_link.parameters():
-                if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                    p.grad.div_(world)
+            grads = [p.grad for p in local_params if p.grad is not None]
+            if grads:
+                flat = torch.cat([g.reshape(-1) for g in grads])
+                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+                flat.div_(world)
+                offset = 0
+                for p in local_params:
+                    if p.grad is not None:
+                        n = p.grad.numel()
+                        p.grad.copy_(flat[offset:offset + n].reshape(p.grad.shape))
+                        offset += n
 
         if optimizer is not None:
             torch.nn.utils.clip_grad_norm_(local_params, max_norm=1.0)
