@@ -730,6 +730,10 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
         print(f"Trainable outer-link parameters (rank {rank}): {n_trainable:,}")
 
     optimizer = AdamW(local_params, lr=cfg.lr, weight_decay=0.01) if local_params else None
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.steps)
+        if optimizer is not None else None
+    )
 
     # ── Dataset (all ranks load, each picks the same sample via shared seed) ─
     if rank == 0:
@@ -751,153 +755,150 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
               f"  world={world}")
         print(f"{'='*70}")
 
+    pipeline = _is_dist() and (rp != rc or rc != rs)
+
     for step in range(cfg.steps):
-        question, answer = problems[rng.integers(len(problems))]
 
-        # ── Forward: all n rounds (paper Eq.6: L_out = CE(S^n(...S^1(x)), y)) ─
-        # Each rank runs only its own agent.  Cross-rank data is sent/recv'd as
-        # plain copies; the receiving rank creates a requires_grad leaf so its
-        # local graph is differentiable.  Backward is handled explicitly below.
-        pipeline = _is_dist() and (rp != rc or rc != rs)
-
-        feedback_prefix = None    # outer_31 output fed back to Planner each round
-        rounds = []               # list of per-round output dicts
-
-        for r in range(cfg.n_rounds):
-            out = forward_one_round(
-                planner_mdl, planner_tok, planner_inner,
-                critic_mdl,  critic_tok,  critic_inner,
-                solver_mdl,  solver_tok,  solver_inner,
-                outer_12, outer_23, outer_31,
-                question=question,
-                answer=answer,
-                feedback_prefix=feedback_prefix,
-                latent_steps=cfg.latent_steps,
-                device=device,
-                dtype=dtype,
-                monitor=monitor,
-                round_idx=r,
-                shared_link=shared_link,
-            )
-            rounds.append(out)
-
-            if r < cfg.n_rounds - 1:
-                # Send outer_31 feedback from rs to rp for the next round.
-                # Barrier-separated so all ranks see sends/recvs in the same order.
-                if pipeline and rs != rp:
-                    if rank == rs:
-                        _send_tensor(out["feedback"], dst=rp)
-                    if rank == rp:
-                        feedback_prefix = _recv_tensor(src=rs, device=device, dtype=dtype,
-                                                       requires_grad=True,
-                                                       shape=(1, cfg.latent_steps, PLANNER_DIM))
-                        out["fb_recv"] = feedback_prefix
-                else:
-                    feedback_prefix = out.get("feedback")
-
-        # ── Loss: CE on final-round Solver output (paper Eq.6) ───────────────
-        last = rounds[-1]
-        loss = None
-        if rank == rs:
-            solver_logits    = last["solver_logits"]
-            solver_input_ids = last["solver_input_ids"]
-            if solver_logits is not None:
-                L = solver_logits.size(1)
-                A = solver_input_ids.size(1)
-                n = min(L, A)
-                if n > 0:
-                    loss = F.cross_entropy(
-                        solver_logits[:, :n].reshape(-1, solver_logits.size(-1)),
-                        solver_input_ids[:, :n].reshape(-1),
-                    )
-
-        # ── Backward: explicit, barrier-separated pipeline grad exchange ──────
-        #
-        # The graph on each rank is local.  Gradients cross rank boundaries via
-        # explicit send/recv, one boundary at a time, with a barrier ensuring
-        # both sides of each exchange are ready before the next step.
-        #
-        # Per round (in reverse), the sequence is:
-        #   Step A  rs: loss.backward() / feedback.backward(g_fb)
-        #             → populates sp_recv.grad (grad w.r.t. solver_prefix input)
-        #   BARRIER
-        #   Step B  rs→rc: send sp_recv.grad  |  rc: recv → backward solver_prefix_rc
-        #             → populates cp_recv.grad (grad w.r.t. critic_prefix input)
-        #   BARRIER
-        #   Step C  rc→rp: send cp_recv.grad  |  rp: recv → backward critic_prefix
-        #             → populates critic_prefix.grad on rp (used by optimizer)
-        #             → if r>0: also populates fb_recv.grad via autograd
-        #   BARRIER
-        #   Step D  (if r>0) rp→rs: send fb_recv.grad  |  rs: recv for next round
-
+        # ── Gradient accumulation over batch_size micro-steps ────────────────
         if optimizer is not None:
             optimizer.zero_grad()
 
-        if not pipeline:
-            # Single-GPU: everything is in one graph, one backward call suffices.
-            if loss is not None:
-                loss.backward()
-        else:
-            for r in range(cfg.n_rounds - 1, -1, -1):
-                o = rounds[r]
+        accum_loss = 0.0
+        for micro in range(cfg.batch_size):
+            question, answer = problems[rng.integers(len(problems))]
 
-                # Step A ── rs: backward through local graph ───────────────────
-                # No barrier needed: rs acts alone, B/C P2P below synchronise.
-                if rank == rs:
-                    if r == cfg.n_rounds - 1:
-                        if loss is not None:
-                            loss.backward()
+            # ── Forward: all n rounds (paper Eq.6: L_out = CE(S^n(...S^1(x)), y))
+            feedback_prefix = None
+            rounds = []
+
+            for r in range(cfg.n_rounds):
+                out = forward_one_round(
+                    planner_mdl, planner_tok, planner_inner,
+                    critic_mdl,  critic_tok,  critic_inner,
+                    solver_mdl,  solver_tok,  solver_inner,
+                    outer_12, outer_23, outer_31,
+                    question=question,
+                    answer=answer,
+                    feedback_prefix=feedback_prefix,
+                    latent_steps=cfg.latent_steps,
+                    device=device,
+                    dtype=dtype,
+                    monitor=monitor,
+                    round_idx=r,
+                    shared_link=shared_link,
+                )
+                rounds.append(out)
+
+                if r < cfg.n_rounds - 1:
+                    if pipeline and rs != rp:
+                        if rank == rs:
+                            _send_tensor(out["feedback"], dst=rp)
+                        if rank == rp:
+                            feedback_prefix = _recv_tensor(src=rs, device=device, dtype=dtype,
+                                                           requires_grad=True,
+                                                           shape=(1, cfg.latent_steps, PLANNER_DIM))
+                            out["fb_recv"] = feedback_prefix
                     else:
-                        g_fb = rounds[r + 1].get("g_fb_for_prev")
-                        fb   = o.get("feedback")
-                        if fb is not None and g_fb is not None:
-                            fb.backward(g_fb)
+                        feedback_prefix = out.get("feedback")
 
-                # Step B ── rs→rc grad (P2P synchronises rs and rc; rp idles) ─
-                if rank == rs:
-                    sp_recv = o.get("sp_recv")
-                    g = sp_recv.grad if (sp_recv is not None and sp_recv.grad is not None) \
-                        else torch.zeros((1, cfg.latent_steps, SOLVER_DIM), dtype=dtype, device=device)
-                    _send_tensor(g, dst=rc)
+            # ── Loss: CE on final-round Solver output, scaled for accumulation ─
+            last = rounds[-1]
+            loss = None
+            if rank == rs:
+                solver_logits    = last["solver_logits"]
+                solver_input_ids = last["solver_input_ids"]
+                if solver_logits is not None:
+                    L = solver_logits.size(1)
+                    A = solver_input_ids.size(1)
+                    n = min(L, A)
+                    if n > 0:
+                        loss = F.cross_entropy(
+                            solver_logits[:, :n].reshape(-1, solver_logits.size(-1)),
+                            solver_input_ids[:, :n].reshape(-1),
+                        ) / cfg.batch_size
 
-                if rank == rc:
-                    sv_pfx = o.get("solver_prefix_rc")
-                    g = _recv_tensor(src=rs, device=device, dtype=dtype,
-                                     shape=(1, cfg.latent_steps, SOLVER_DIM))
-                    if sv_pfx is not None:
-                        sv_pfx.backward(g)
+            # ── Backward: explicit, barrier-separated pipeline grad exchange ──
+            #
+            # Per round (in reverse):
+            #   Step A  rs: loss.backward() / feedback.backward(g_fb)
+            #             → populates sp_recv.grad
+            #   Step B  rs→rc: send sp_recv.grad  |  rc: recv → backward solver_prefix_rc
+            #             → populates cp_recv.grad
+            #   Step C  rc→rp: send cp_recv.grad  |  rp: recv → backward critic_prefix
+            #   Step D  (if r>0) rp→rs: send fb_recv.grad
 
-                # Step C ── rc→rp grad (P2P synchronises rc and rp; rs idles) ─
-                if rank == rc:
-                    cp_recv = o.get("cp_recv")
-                    g = cp_recv.grad if (cp_recv is not None and cp_recv.grad is not None) \
-                        else torch.zeros((1, cfg.latent_steps, CRITIC_DIM), dtype=dtype, device=device)
-                    _send_tensor(g, dst=rp)
+            if not pipeline:
+                if loss is not None:
+                    loss.backward()
+            else:
+                for r in range(cfg.n_rounds - 1, -1, -1):
+                    o = rounds[r]
 
-                if rank == rp:
-                    cr_pfx = o.get("critic_prefix")
-                    g = _recv_tensor(src=rc, device=device, dtype=dtype,
-                                     shape=(1, cfg.latent_steps, CRITIC_DIM))
-                    if cr_pfx is not None:
-                        cr_pfx.backward(g)
-
-                # Step D ── rp→rs feedback grad (only when r>0) ───────────────
-                # Both sides execute before the loop's next iteration; no barrier needed.
-                if r > 0 and pipeline and rs != rp:
-                    if rank == rp:
-                        fb_recv = rounds[r - 1].get("fb_recv")
-                        g = fb_recv.grad if (fb_recv is not None and fb_recv.grad is not None) \
-                            else torch.zeros((1, cfg.latent_steps, PLANNER_DIM), dtype=dtype, device=device)
-                        _send_tensor(g, dst=rs)
+                    # Step A ── rs: backward through local graph ───────────────
                     if rank == rs:
-                        o["g_fb_for_prev"] = _recv_tensor(src=rp, device=device, dtype=dtype,
-                                                          shape=(1, cfg.latent_steps, PLANNER_DIM))
+                        if r == cfg.n_rounds - 1:
+                            if loss is not None:
+                                loss.backward()
+                        else:
+                            g_fb = rounds[r + 1].get("g_fb_for_prev")
+                            fb   = o.get("feedback")
+                            if fb is not None and g_fb is not None:
+                                fb.backward(g_fb)
 
-        # One barrier after all backward rounds to sync before optimizer step.
+                    # Step B ── rs→rc grad ─────────────────────────────────────
+                    if rank == rs:
+                        sp_recv = o.get("sp_recv")
+                        g = sp_recv.grad if (sp_recv is not None and sp_recv.grad is not None) \
+                            else torch.zeros((1, cfg.latent_steps, SOLVER_DIM), dtype=dtype, device=device)
+                        _send_tensor(g, dst=rc)
+
+                    if rank == rc:
+                        sv_pfx = o.get("solver_prefix_rc")
+                        g = _recv_tensor(src=rs, device=device, dtype=dtype,
+                                         shape=(1, cfg.latent_steps, SOLVER_DIM))
+                        if sv_pfx is not None:
+                            sv_pfx.backward(g)
+
+                    # Step C ── rc→rp grad ─────────────────────────────────────
+                    if rank == rc:
+                        cp_recv = o.get("cp_recv")
+                        g = cp_recv.grad if (cp_recv is not None and cp_recv.grad is not None) \
+                            else torch.zeros((1, cfg.latent_steps, CRITIC_DIM), dtype=dtype, device=device)
+                        _send_tensor(g, dst=rp)
+
+                    if rank == rp:
+                        cr_pfx = o.get("critic_prefix")
+                        g = _recv_tensor(src=rc, device=device, dtype=dtype,
+                                         shape=(1, cfg.latent_steps, CRITIC_DIM))
+                        if cr_pfx is not None:
+                            cr_pfx.backward(g)
+
+                    # Step D ── rp→rs feedback grad (only when r>0) ───────────
+                    if r > 0 and pipeline and rs != rp:
+                        if rank == rp:
+                            fb_recv = rounds[r - 1].get("fb_recv")
+                            g = fb_recv.grad if (fb_recv is not None and fb_recv.grad is not None) \
+                                else torch.zeros((1, cfg.latent_steps, PLANNER_DIM), dtype=dtype, device=device)
+                            _send_tensor(g, dst=rs)
+                        if rank == rs:
+                            o["g_fb_for_prev"] = _recv_tensor(src=rp, device=device, dtype=dtype,
+                                                              shape=(1, cfg.latent_steps, PLANNER_DIM))
+
+            # Accumulate loss scalar for logging (rank_solver holds the true value).
+            if _is_dist():
+                loss_micro = torch.tensor(
+                    [loss.item() if loss is not None else float("nan")],
+                    dtype=torch.float32, device=device,
+                )
+                dist.broadcast(loss_micro, src=rs)
+                accum_loss += loss_micro.item()
+            else:
+                accum_loss += loss.item() if loss is not None else float("nan")
+
+        # ── End of accumulation window: sync, clip, step ─────────────────────
         _barrier()
 
-        # Flattened allreduce for SharedRecursiveLink: pack all grads into one
-        # buffer, allreduce once, unpack. Much cheaper than per-parameter calls.
+        # Flattened allreduce for SharedRecursiveLink.
         if _is_dist() and shared_link is not None:
             grads = [p.grad for p in local_params if p.grad is not None]
             if grads:
@@ -914,6 +915,7 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
         if optimizer is not None:
             torch.nn.utils.clip_grad_norm_(local_params, max_norm=1.0)
             optimizer.step()
+            scheduler.step()
 
         # ── Logging ──────────────────────────────────────────────────────────
         if rank == rp and monitor is not None:
@@ -921,16 +923,7 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
         if _is_dist():
             _sync_norms_all_ranks(monitor, cfg.n_rounds)
 
-        # Broadcast loss scalar from rank_solver to rank 0 for printing
-        if _is_dist():
-            loss_val = torch.tensor(
-                [loss.item() if loss is not None else float("nan")],
-                dtype=torch.float32, device=device,
-            )
-            dist.broadcast(loss_val, src=rs)
-            loss_scalar = loss_val.item()
-        else:
-            loss_scalar = loss.item() if loss is not None else float("nan")
+        loss_scalar = accum_loss / cfg.batch_size
 
         if rank == 0:
             losses.append(loss_scalar)
@@ -1108,9 +1101,11 @@ def parse_args():
     )
     p.add_argument("--n_rounds", type=int, nargs="+", default=[3],
                    help="Recursion rounds. Multiple values → sweep.")
-    p.add_argument("--latent_steps", type=int, default=8)
+    p.add_argument("--latent_steps", type=int, default=80)
     p.add_argument("--steps", type=int, default=50)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--batch_size", type=int, default=4,
+                   help="Gradient accumulation steps (problems per optimizer update).")
     p.add_argument("--n_samples", type=int, default=100)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_prefix", type=str, default="outerlink_grad")
