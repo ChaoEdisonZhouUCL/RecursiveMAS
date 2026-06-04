@@ -802,16 +802,14 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
             solver_logits    = last["solver_logits"]
             solver_input_ids = last["solver_input_ids"]
             if solver_logits is not None:
-                L          = solver_logits.size(1)
-                target_ids = solver_input_ids[:, 1:L + 1]
-                n          = min(L, target_ids.size(1))
-                loss = F.cross_entropy(
-                    solver_logits[:, :n].reshape(-1, solver_logits.size(-1)),
-                    target_ids[:, :n].reshape(-1),
-                ) if n > 0 else F.cross_entropy(
-                    solver_logits.reshape(-1, solver_logits.size(-1)),
-                    solver_input_ids[:, :solver_logits.size(1)].reshape(-1),
-                )
+                L = solver_logits.size(1)
+                A = solver_input_ids.size(1)
+                n = min(L, A)
+                if n > 0:
+                    loss = F.cross_entropy(
+                        solver_logits[:, :n].reshape(-1, solver_logits.size(-1)),
+                        solver_input_ids[:, :n].reshape(-1),
+                    )
 
         # ── Backward: explicit, barrier-separated pipeline grad exchange ──────
         #
