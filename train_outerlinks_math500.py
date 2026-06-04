@@ -477,7 +477,7 @@ def latent_rollout(
     finally:
         handle.remove()
 
-    return torch.cat(hidden_states, dim=1)   # (1, latent_steps, d)
+    return torch.cat(hidden_states, dim=1), past_key_values  # (1, latent_steps, d), cache
 
 
 # ── Gradient monitor ─────────────────────────────────────────────────────────
@@ -580,8 +580,8 @@ def forward_one_round(
             planner_tok, planner_mdl.get_input_embeddings(),
             pre, post, feedback_prefix, device, dtype,
         )
-        planner_h = latent_rollout(planner_mdl, planner_inner, ie, am, latent_steps, dtype,
-                                   agent_idx=1, shared_link=shared_link)
+        planner_h, _ = latent_rollout(planner_mdl, planner_inner, ie, am, latent_steps, dtype,
+                                      agent_idx=1, shared_link=shared_link)
         if shared_link is not None:
             critic_prefix = shared_link(planner_h, src=1, dst=2)
         else:
@@ -605,8 +605,8 @@ def forward_one_round(
             critic_tok, critic_mdl.get_input_embeddings(),
             pre_c, post_c, critic_prefix, device, dtype,
         )
-        critic_h = latent_rollout(critic_mdl, critic_inner, critic_input, critic_am, latent_steps, dtype,
-                                  agent_idx=2, shared_link=shared_link)
+        critic_h, _ = latent_rollout(critic_mdl, critic_inner, critic_input, critic_am, latent_steps, dtype,
+                                     agent_idx=2, shared_link=shared_link)
         if shared_link is not None:
             solver_prefix = shared_link(critic_h, src=2, dst=3)
         else:
@@ -628,30 +628,28 @@ def forward_one_round(
             solver_tok, solver_mdl.get_input_embeddings(),
             pre_s, post_s, solver_prefix, device, dtype,
         )
-        solver_h = latent_rollout(solver_mdl, solver_inner, solver_input, solver_am, latent_steps, dtype,
-                                  agent_idx=3, shared_link=shared_link)
+        solver_h, solver_kv = latent_rollout(solver_mdl, solver_inner, solver_input, solver_am, latent_steps, dtype,
+                                             agent_idx=3, shared_link=shared_link)
         if shared_link is not None:
             feedback = shared_link(solver_h, src=3, dst=1)
         else:
             feedback = outer_31(solver_h)
         # Teacher-forced CE against ground-truth answer y (paper Eq.6).
-        # Append answer token embeddings to the solver's context and run one
-        # forward pass; logits over the answer positions are the CE targets.
+        # Continue from the latent rollout KV-cache so the model is conditioned
+        # on the full latent context without re-processing it (avoids NaN from
+        # out-of-distribution hidden states being run through the model again).
         solver_input_ids = solver_tok(answer, return_tensors="pt",
                                       add_special_tokens=False).to(device)["input_ids"]
         embed_fn = solver_mdl.get_input_embeddings()
         with torch.no_grad():
             answer_embeds = embed_fn(solver_input_ids).to(dtype)   # (1, A, d)
-        # Concatenate: [prompt + latent context] then [answer tokens].
-        # The model sees the full context; we only supervise the answer positions.
-        tf_embeds = torch.cat([solver_input, answer_embeds], dim=1)
-        tf_am     = torch.cat([solver_am,
-                               solver_am.new_ones((1, answer_embeds.size(1)))], dim=1)
-        tf_out    = solver_mdl(inputs_embeds=tf_embeds, attention_mask=tf_am,
-                               return_dict=True)
-        # Logits aligned to answer tokens: the last A positions of the output.
-        A             = solver_input_ids.size(1)
-        solver_logits = tf_out.logits[:, -A:, :]   # (1, A, vocab)
+        kv_len  = solver_am.size(1) + latent_steps
+        tf_am   = torch.ones((1, kv_len + solver_input_ids.size(1)),
+                             dtype=solver_am.dtype, device=device)
+        tf_out  = solver_mdl(inputs_embeds=answer_embeds, attention_mask=tf_am,
+                             past_key_values=solver_kv, use_cache=False,
+                             return_dict=True)
+        solver_logits = tf_out.logits   # (1, A, vocab)
         out["feedback"]         = feedback
         out["solver_logits"]    = solver_logits
         out["solver_input_ids"] = solver_input_ids
