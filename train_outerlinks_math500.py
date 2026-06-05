@@ -1,30 +1,43 @@
 #!/usr/bin/env python3
 """
-Train the outer-links of RecursiveMAS-Light on MATH-500 and monitor
-gradient norms across recursion rounds to diagnose vanishing gradients.
+Outer-loop training of RecursiveMAS-Light outer RecursiveLinks on MATH-500.
+Implements §4 "Learning to Recur as a Whole" (paper Eq. 6) with pipeline parallelism.
 
 Architecture (Sequential-Light):
-    Planner  (Qwen3-1.7B,        d=2048)
-       ↓  outer_12  (2048→2048)
-    Critic   (LLaMA-3.2-1B,     d=2048)
-       ↓  outer_23  (2048→1536)
-    Solver   (Qwen2.5-Math-1.5B, d=1536)
-       ↓  outer_31  (1536→2048)  ──► back to Planner (next round)
+    Planner  (Qwen3-1.7B,        d=2048)  ← frozen backbone + frozen inner link
+       ↓  outer_12  (2048→2048)            ← trained from random init
+    Critic   (LLaMA-3.2-1B,     d=2048)  ← frozen backbone + frozen inner link
+       ↓  outer_23  (2048→1536)            ← trained from random init
+    Solver   (Qwen2.5-Math-1.5B, d=1536)  ← frozen backbone + frozen inner link
+       ↓  outer_31  (1536→2048)  ──► back to Planner (next round)  ← trained from random init
+
+Training follows the paper's outer-loop procedure:
+  1. Unroll the full recursive loop for n rounds (forward pass, full graph preserved).
+  2. Apply CE loss only at the final round on the Solver's teacher-forced output vs y.
+  3. Back-propagate gradients through the full n-round graph jointly, assigning credit
+     to each outer link according to its global contribution (paper Eq. 6, Theorem 4.1).
+  4. All LLM backbone and inner-link parameters remain frozen throughout.
+  Hyperparams (paper §5, App. B.3): AdamW lr=5e-4, cosine schedule, batch_size=4.
 
 Two training modes (--mode):
-  original    — three independent CrossModelAdapters, one per rank
+  original    — three independent CrossModelAdapters, one per rank (paper default)
   shared_roae — one SharedRecursiveLink with MoE core + Rotary Agent Encoding
                 loaded on ALL ranks; gradients allreduced after each backward step
   compare     — run both sequentially on the same problems and produce a side-by-side plot
 
-Multi-GPU (pipeline parallelism)
+Pipeline parallelism (multi-GPU)
 ---------------------------------
-Launch with torchrun:
+Launch with torchrun (one rank per agent):
     torchrun --standalone --nproc_per_node=3 train_outerlinks_math500.py
 
   rank 0 → Planner  + outer_12  (2048→2048)
   rank 1 → Critic   + outer_23  (2048→1536)
   rank 2 → Solver   + outer_31  (1536→2048)
+
+Backward pass uses explicit, barrier-separated P2P grad exchanges (Steps A–D per round)
+so that each rank accumulates gradients for only its own outer link.
+retain_graph=True is used on all backward calls except the final one so the shared
+n-round computation graph is not freed prematurely.
 
 Single-GPU fallback
 -------------------
@@ -33,9 +46,9 @@ All three agents load onto cuda:0 (or cpu).
 
 Usage
 -----
-  python  train_outerlinks_math500.py --n_rounds 3 --steps 100
+  python  train_outerlinks_math500.py --n_rounds 3 --steps 200 --batch_size 4 --lr 5e-4
   torchrun --standalone --nproc_per_node=3 \\
-           train_outerlinks_math500.py --n_rounds 3 --steps 100 --mode compare
+           train_outerlinks_math500.py --n_rounds 3 --steps 200 --batch_size 4 --lr 5e-4
 """
 
 import argparse
@@ -54,14 +67,21 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from datasets import load_dataset
-from huggingface_hub import snapshot_download
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 THIS_DIR = Path(__file__).parent
 sys.path.insert(0, str(THIS_DIR))
 
-from modeling import CrossModelAdapter, infer_outer_adapter_type_from_state_dict
+from modeling import CrossModelAdapter, OUTER_ADAPTER_TYPE, infer_outer_adapter_type_from_state_dict
+from hf_resolver import resolve_inner_adapter, snapshot_repo, task_for_inner_repo
+from prompts import (
+    FEEDBACK_SLOT, PLANNER_SLOT, REFINED_SLOT,
+    build_math_planner_prompt,
+    build_math_planner_prompt_with_feedback_slot,
+    build_math_refiner_prompt_with_slot,
+    build_math_solver_prompt_with_slots,
+)
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 if HF_TOKEN:
@@ -267,39 +287,11 @@ def _recv_tensor(src: int, device: torch.device, dtype: torch.dtype,
 
 # ── Model loading helpers ────────────────────────────────────────────────────
 
-def _resolve(repo_id: str) -> str:
-    try:
-        return snapshot_download(repo_id, local_files_only=True, token=HF_TOKEN)
-    except Exception:
-        return snapshot_download(repo_id, token=HF_TOKEN)
-
-
-def _plain_view(model_dir: str) -> str:
-    p = Path(model_dir)
-    if not (p / "adapter_config.json").is_file():
-        return model_dir
-    view = p / "_plain_model_view"
-    if view.is_dir():
-        return str(view)
-    view.mkdir(parents=True, exist_ok=True)
-    skip = {"adapter_config.json", "innerlink_config.json", "README.md"}
-    for item in p.iterdir():
-        if item.name == view.name or item.name in skip:
-            continue
-        if item.name.startswith("adapter(") or item.suffix == ".pt":
-            continue
-        tgt = view / item.name
-        if not tgt.exists():
-            tgt.symlink_to(item.resolve())
-    return str(view)
-
-
 def load_model_and_tokenizer(repo_id: str, device: torch.device, dtype: torch.dtype):
-    local = _resolve(repo_id)
-    path  = _plain_view(local)
-    tok   = AutoTokenizer.from_pretrained(path, trust_remote_code=True, token=HF_TOKEN)
-    mdl   = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=dtype, device_map=str(device),
+    path = snapshot_repo(repo_id)
+    tok  = AutoTokenizer.from_pretrained(str(path), trust_remote_code=True, token=HF_TOKEN)
+    mdl  = AutoModelForCausalLM.from_pretrained(
+        str(path), torch_dtype=dtype, device_map=str(device),
         trust_remote_code=True, token=HF_TOKEN,
     )
     mdl.eval()
@@ -310,21 +302,14 @@ def load_model_and_tokenizer(repo_id: str, device: torch.device, dtype: torch.dt
 
 def load_inner_adapter(repo_id: str, hidden: int, device: torch.device, dtype: torch.dtype):
     from modeling import Adapter, INNER_ADAPTER_TYPE
-    local = _resolve(repo_id)
-    pt = Path(local) / "adapter(math).pt"
-    sd = torch.load(str(pt), map_location="cpu")
+    repo_dir = snapshot_repo(repo_id)
+    task     = task_for_inner_repo("math500")          # always "math" for this dataset
+    pt_path  = resolve_inner_adapter(repo_dir, task)
+    sd = torch.load(str(pt_path), map_location="cpu")
     a  = Adapter(hidden_size=hidden, adapter_type=INNER_ADAPTER_TYPE)
     a.load_state_dict(sd, strict=True)
     return a.to(device=device, dtype=dtype).eval()
 
-
-def load_outer_adapter(pt_path: str, in_dim: int, out_dim: int,
-                       device: torch.device, dtype: torch.dtype) -> CrossModelAdapter:
-    sd    = torch.load(pt_path, map_location="cpu")
-    atype = infer_outer_adapter_type_from_state_dict(sd)
-    a     = CrossModelAdapter(in_dim=in_dim, out_dim=out_dim, adapter_type=atype)
-    a.load_state_dict(sd, strict=True)
-    return a.to(device=device, dtype=dtype)
 
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
@@ -337,22 +322,28 @@ def load_math500(n_samples: int = 0, seed: int = 42):
 
 
 def build_planner_prompt(question: str) -> Tuple[str, str]:
-    """Returns (prefix, suffix) around the latent embedding slot."""
-    pre  = "You are a planner agent in a recursive multi-agent system. Here is the latent information from previous round:\n"
-    post = f"Given the latent information, you should output a step-by-step plan to solve the question: {question}"
+    """Round 1 planner: no feedback slot — returns ("full prompt", "")."""
+    return build_math_planner_prompt(question), ""
+
+
+def build_planner_feedback_prompt(question: str) -> Tuple[str, str]:
+    """Rounds 2+: splits on FEEDBACK_SLOT so the latent is injected there."""
+    full = build_math_planner_prompt_with_feedback_slot(question)
+    pre, post = full.split(FEEDBACK_SLOT, 1)
     return pre, post
 
 
 def build_critic_prompt(question: str) -> Tuple[str, str]:
-    pre  = "You are a critic agent in a recursive multi-agent system. Here is the latent information from previous agent:\n"
-    post = f"Given the latent information, you should critique the initial plan and output an improved plan to solve the question: {question}"
+    """Splits on PLANNER_SLOT so the planner latent is injected there."""
+    full = build_math_refiner_prompt_with_slot(question)
+    pre, post = full.split(PLANNER_SLOT, 1)
     return pre, post
 
 
 def build_solver_prompt(question: str) -> Tuple[str, str]:
-    pre  = "You are a solver agent in a recursive multi-agent system. Here is the latent information from previous agent:\n"
-    post = (f"Given the latent information, you should solve the question and provide the final answer: {question}\n"
-            "Solve the question and put the final answer inside \\boxed{}.")
+    """Splits on REFINED_SLOT so the refiner latent is injected there."""
+    full = build_math_solver_prompt_with_slots(question)
+    pre, post = full.split(REFINED_SLOT, 1)
     return pre, post
 
 
@@ -366,12 +357,19 @@ def _build_input_embeds(tokenizer, embed_fn, pre: str, post: str,
 
     When latent is None (first round, no prior agent), only [pre + post] is used.
     """
-    enc_pre  = tokenizer(pre,  return_tensors="pt", add_special_tokens=True).to(device)
-    enc_post = tokenizer(post, return_tensors="pt", add_special_tokens=False).to(device)
-
+    enc_pre = tokenizer(pre, return_tensors="pt", add_special_tokens=True).to(device)
     with torch.no_grad():
-        emb_pre  = embed_fn(enc_pre["input_ids"]).to(dtype)   # (1, T_pre, d)
-        emb_post = embed_fn(enc_post["input_ids"]).to(dtype)  # (1, T_post, d)
+        emb_pre = embed_fn(enc_pre["input_ids"]).to(dtype)    # (1, T_pre, d)
+
+    # Avoid tokenizing an empty suffix — some tokenizers emit a spurious BOS/pad token.
+    if post:
+        enc_post = tokenizer(post, return_tensors="pt", add_special_tokens=False).to(device)
+        with torch.no_grad():
+            emb_post = embed_fn(enc_post["input_ids"]).to(dtype)   # (1, T_post, d)
+        am_post = enc_post["attention_mask"]
+    else:
+        emb_post = emb_pre.new_zeros((1, 0, emb_pre.size(-1)))
+        am_post  = enc_pre["attention_mask"].new_zeros((1, 0))
 
     if latent is not None:
         lat = latent.to(dtype)                                 # (1, T_lat, d)
@@ -379,11 +377,11 @@ def _build_input_embeds(tokenizer, embed_fn, pre: str, post: str,
         am  = torch.cat([
             enc_pre["attention_mask"],
             enc_pre["attention_mask"].new_ones((1, lat.size(1))),
-            enc_post["attention_mask"],
+            am_post,
         ], dim=1)
     else:
         ie = torch.cat([emb_pre, emb_post], dim=1)
-        am = torch.cat([enc_pre["attention_mask"], enc_post["attention_mask"]], dim=1)
+        am = torch.cat([enc_pre["attention_mask"], am_post], dim=1)
 
     return ie, am
 
@@ -428,10 +426,16 @@ def latent_rollout(
     dtype: torch.dtype,
     agent_idx: int = 0,
     shared_link: Optional["SharedRecursiveLink"] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, object, torch.Tensor]:
     """
     Run `latent_steps` steps of inner-adapter auto-regression in latent space.
-    Returns concatenated last-layer hidden states: (1, latent_steps, d_model).
+
+    Returns:
+        hidden_states : (1, latent_steps, d_model)  — in autograd graph; used by outer link
+                        and by lm_head for CE loss (paper Fig. 4, §4 Eq. 6).
+        past_key_values                              — detached KV cache (unused by callers;
+                        kept for API symmetry in case callers need it).
+        grown_am      : (1, prompt_len+latent_steps) — attention mask after rollout.
 
     When shared_link is provided (shared_roae mode), the inner self-loop uses
     SharedRecursiveLink(h, src=agent_idx, dst=agent_idx) instead of inner_adapter.
@@ -470,14 +474,14 @@ def latent_rollout(
             am = torch.cat([am, am.new_ones((am.size(0), 1))], dim=1)
             with torch.no_grad():
                 if shared_link is not None:
-                    # Inner self-loop: same agent speaks to itself.
                     ie = shared_link(last_h.detach().unsqueeze(1), src=agent_idx, dst=agent_idx).to(dtype)
                 else:
                     ie = inner_adapter(last_h.detach()).unsqueeze(1).to(dtype)
     finally:
         handle.remove()
 
-    return torch.cat(hidden_states, dim=1), past_key_values  # (1, latent_steps, d), cache
+    # am has grown by latent_steps; return it so callers can build the right teacher-forcing mask.
+    return torch.cat(hidden_states, dim=1), past_key_values, am
 
 
 # ── Gradient monitor ─────────────────────────────────────────────────────────
@@ -575,19 +579,27 @@ def forward_one_round(
 
     # ── Stage 1: Planner computes critic_prefix, sends to Critic ─────────────
     if rank == rp:
-        pre, post = build_planner_prompt(question)
+        if feedback_prefix is None:
+            # Round 1: no feedback — use flat prompt, no slot injection.
+            pre, post = build_planner_prompt(question)
+        else:
+            # Rounds 2+: inject solver feedback at FEEDBACK_SLOT.
+            pre, post = build_planner_feedback_prompt(question)
         ie, am = _build_input_embeds(
             planner_tok, planner_mdl.get_input_embeddings(),
             pre, post, feedback_prefix, device, dtype,
         )
-        planner_h, _ = latent_rollout(planner_mdl, planner_inner, ie, am, latent_steps, dtype,
-                                      agent_idx=1, shared_link=shared_link)
+        planner_h, _, _ = latent_rollout(planner_mdl, planner_inner, ie, am, latent_steps, dtype,
+                                         agent_idx=1, shared_link=shared_link)
         if shared_link is not None:
             critic_prefix = shared_link(planner_h, src=1, dst=2)
         else:
             critic_prefix = outer_12(planner_h)
         if monitor is not None:
             monitor.register_output(critic_prefix, round_idx)
+        # retain_grad so the pipeline backward can read .grad even though this
+        # tensor is an intermediate (non-leaf) in the local graph.
+        critic_prefix.retain_grad()
         out["critic_prefix"] = critic_prefix
         if pipeline:
             _send_tensor(critic_prefix, dst=rc)
@@ -595,6 +607,7 @@ def forward_one_round(
     if pipeline and rp != rc and rank == rc:
         cp_recv = _recv_tensor(src=rp, device=device, dtype=dtype, requires_grad=True,
                                shape=(1, latent_steps, CRITIC_DIM))
+        cp_recv.retain_grad()
         out["cp_recv"] = cp_recv
         critic_prefix  = cp_recv
 
@@ -605,12 +618,13 @@ def forward_one_round(
             critic_tok, critic_mdl.get_input_embeddings(),
             pre_c, post_c, critic_prefix, device, dtype,
         )
-        critic_h, _ = latent_rollout(critic_mdl, critic_inner, critic_input, critic_am, latent_steps, dtype,
-                                     agent_idx=2, shared_link=shared_link)
+        critic_h, _, _ = latent_rollout(critic_mdl, critic_inner, critic_input, critic_am, latent_steps, dtype,
+                                        agent_idx=2, shared_link=shared_link)
         if shared_link is not None:
             solver_prefix = shared_link(critic_h, src=2, dst=3)
         else:
             solver_prefix = outer_23(critic_h)
+        solver_prefix.retain_grad()
         out["solver_prefix_rc"] = solver_prefix
         if pipeline and rc != rs:
             _send_tensor(solver_prefix, dst=rs)
@@ -618,6 +632,7 @@ def forward_one_round(
     if pipeline and rc != rs and rank == rs:
         sp_recv = _recv_tensor(src=rc, device=device, dtype=dtype, requires_grad=True,
                                shape=(1, latent_steps, SOLVER_DIM))
+        sp_recv.retain_grad()
         out["sp_recv"] = sp_recv
         solver_prefix  = sp_recv
 
@@ -628,28 +643,39 @@ def forward_one_round(
             solver_tok, solver_mdl.get_input_embeddings(),
             pre_s, post_s, solver_prefix, device, dtype,
         )
-        solver_h, solver_kv = latent_rollout(solver_mdl, solver_inner, solver_input, solver_am, latent_steps, dtype,
-                                             agent_idx=3, shared_link=shared_link)
+        solver_h, _, _ = latent_rollout(
+            solver_mdl, solver_inner, solver_input, solver_am, latent_steps, dtype,
+            agent_idx=3, shared_link=shared_link,
+        )
         if shared_link is not None:
             feedback = shared_link(solver_h, src=3, dst=1)
         else:
             feedback = outer_31(solver_h)
-        # Teacher-forced CE against ground-truth answer y (paper Eq.6).
-        # Continue from the latent rollout KV-cache so the model is conditioned
-        # on the full latent context without re-processing it (avoids NaN from
-        # out-of-distribution hidden states being run through the model again).
+        feedback.retain_grad()
+
+        # Compute CE loss by projecting the latent hidden states through the
+        # solver's lm_head (paper Fig. 4: "Decode for Outputs" at final round).
+        #
+        # Why not teacher-forcing from KV cache:
+        #   answer_embeds is produced under no_grad → requires_grad=False → the
+        #   CE loss gradient cannot flow back through tf_out to solver_h or any
+        #   outer link parameter. The gradient path would be dead.
+        #
+        # Correct path: solver_h (1, latent_steps, d) is IN the autograd graph
+        # because the latent rollout forward runs without no_grad on the model
+        # (frozen params means param.grad=None, but the graph still connects
+        # inputs→outputs). So:
+        #   loss → lm_head(solver_h) → solver_h → model(inputs_embeds=...) →
+        #   inputs_embeds containing sp_recv → outer_23 params ✓
+        #   and separately: outer_31(solver_h) → feedback ✓
+        #
+        # We apply lm_head to ALL latent steps and compute CE against the gold
+        # answer tokens aligned to the last `A` latent steps (or pad/truncate).
         solver_input_ids = solver_tok(answer, return_tensors="pt",
                                       add_special_tokens=False).to(device)["input_ids"]
-        embed_fn = solver_mdl.get_input_embeddings()
-        with torch.no_grad():
-            answer_embeds = embed_fn(solver_input_ids).to(dtype)   # (1, A, d)
-        kv_len  = solver_am.size(1) + latent_steps
-        tf_am   = torch.ones((1, kv_len + solver_input_ids.size(1)),
-                             dtype=solver_am.dtype, device=device)
-        tf_out  = solver_mdl(inputs_embeds=answer_embeds, attention_mask=tf_am,
-                             past_key_values=solver_kv, use_cache=False,
-                             return_dict=True)
-        solver_logits = tf_out.logits   # (1, A, vocab)
+        lm_head = solver_mdl.lm_head                                      # weight-tied, frozen
+        # solver_h: (1, latent_steps, d_solver) — project each step to vocab
+        solver_logits = lm_head(solver_h.float()).to(dtype)               # (1, latent_steps, vocab)
         out["feedback"]         = feedback
         out["solver_logits"]    = solver_logits
         out["solver_input_ids"] = solver_input_ids
@@ -702,7 +728,6 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     _barrier()
 
     # ── Load outer-link adapters ─────────────────────────────────────────────
-    outer_dir = Path(_resolve(OUTER_REPO))
     outer_12 = outer_23 = outer_31 = None
     shared_link = None
 
@@ -719,23 +744,20 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
             n_sl = sum(p.numel() for p in shared_link.parameters() if p.requires_grad)
             print(f"SharedRecursiveLink trainable params: {n_sl:,}  (shared dim={shared_dim})")
     else:
+        # Randomly initialise outer links — only these are trained; pretrained
+        # weights are intentionally NOT loaded so the adapters start from scratch.
         if rank == rp:
-            outer_12 = load_outer_adapter(
-                str(outer_dir / "Planner-Critic-Outerlink(math).pt"),
-                in_dim=PLANNER_DIM, out_dim=CRITIC_DIM, device=device, dtype=dtype,
-            ).train()
-
+            outer_12 = CrossModelAdapter(
+                in_dim=PLANNER_DIM, out_dim=CRITIC_DIM, adapter_type=OUTER_ADAPTER_TYPE,
+            ).to(device=device, dtype=dtype).train()
         if rank == rc:
-            outer_23 = load_outer_adapter(
-                str(outer_dir / "Critic-Solver-Outerlink(math).pt"),
-                in_dim=CRITIC_DIM, out_dim=SOLVER_DIM, device=device, dtype=dtype,
-            ).train()
-
+            outer_23 = CrossModelAdapter(
+                in_dim=CRITIC_DIM, out_dim=SOLVER_DIM, adapter_type=OUTER_ADAPTER_TYPE,
+            ).to(device=device, dtype=dtype).train()
         if rank == rs:
-            outer_31 = load_outer_adapter(
-                str(outer_dir / "Solver-Planner-Outerlink(math).pt"),
-                in_dim=SOLVER_DIM, out_dim=PLANNER_DIM, device=device, dtype=dtype,
-            ).train()
+            outer_31 = CrossModelAdapter(
+                in_dim=SOLVER_DIM, out_dim=PLANNER_DIM, adapter_type=OUTER_ADAPTER_TYPE,
+            ).to(device=device, dtype=dtype).train()
 
     # ── Optimiser: each rank optimises only its own outer link ───────────────
     local_params = []
@@ -818,35 +840,51 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                             feedback_prefix = _recv_tensor(src=rs, device=device, dtype=dtype,
                                                            requires_grad=True,
                                                            shape=(1, cfg.latent_steps, PLANNER_DIM))
+                            # retain_grad so Step D of pipeline backward can read .grad.
+                            feedback_prefix.retain_grad()
                             out["fb_recv"] = feedback_prefix
                     else:
                         feedback_prefix = out.get("feedback")
 
-            # ── Loss: CE on final-round Solver output, scaled for accumulation ─
+            # ── Loss: CE on final-round Solver latent output (paper §4, Eq. 6) ──
+            # solver_logits: (1, latent_steps, vocab) — from lm_head(solver_h).
+            # solver_input_ids: (1, A) — gold answer tokens.
+            # We align the LAST min(latent_steps, A) logits against the gold
+            # tokens: the solver's final latent steps should predict the answer.
+            # This keeps the gradient path alive: loss → lm_head → solver_h →
+            # frozen model forward → outer_23-provided input embeddings → outer_23.
             last = rounds[-1]
             loss = None
             if rank == rs:
-                solver_logits    = last["solver_logits"]
-                solver_input_ids = last["solver_input_ids"]
-                if solver_logits is not None:
-                    # solver_logits: (1, A, vocab) over the A answer positions.
-                    # Standard next-token shift: logit[t] predicts target[t+1].
-                    # So we use logits[:-1] vs targets[1:], giving A-1 pairs.
-                    if solver_logits.size(1) > 1:
-                        loss = F.cross_entropy(
-                            solver_logits[:, :-1].reshape(-1, solver_logits.size(-1)),
-                            solver_input_ids[:, 1:].reshape(-1),
-                        ) / cfg.batch_size
+                solver_logits    = last["solver_logits"]    # (1, latent_steps, vocab)
+                solver_input_ids = last["solver_input_ids"] # (1, A)
+                if solver_logits is not None and solver_input_ids is not None:
+                    L = solver_logits.size(1)  # latent_steps
+                    A = solver_input_ids.size(1)
+                    n_pairs = min(L, A)
+                    if n_pairs > 0:
+                        # Align: last n_pairs logits predict the first n_pairs answer tokens.
+                        logits_sel = solver_logits[:, -n_pairs:].reshape(-1, solver_logits.size(-1))
+                        target_sel = solver_input_ids[:, :n_pairs].reshape(-1)
+                        loss = F.cross_entropy(logits_sel, target_sel) / cfg.batch_size
 
             # ── Backward: explicit, barrier-separated pipeline grad exchange ──
             #
-            # Per round (in reverse):
-            #   Step A  rs: loss.backward() / feedback.backward(g_fb)
-            #             → populates sp_recv.grad
-            #   Step B  rs→rc: send sp_recv.grad  |  rc: recv → backward solver_prefix_rc
+            # We walk rounds in reverse (n-1 → 0). Per round:
+            #   Step A  rs: loss.backward(retain_graph) or feedback.backward(g_fb)
+            #             → populates sp_recv.grad (via retain_grad)
+            #   Step B  rs→rc: send sp_recv.grad  |  rc: recv → solver_prefix_rc.backward(g)
             #             → populates cp_recv.grad
-            #   Step C  rc→rp: send cp_recv.grad  |  rp: recv → backward critic_prefix
-            #   Step D  (if r>0) rp→rs: send fb_recv.grad
+            #   Step C  rc→rp: send cp_recv.grad  |  rp: recv → critic_prefix.backward(g)
+            #             → populates fb_recv.grad (for rounds r>0)
+            #   Step D  rp→rs: send fb_recv.grad so rs can use it in round r-1's Step A
+            #
+            # retain_graph=True is needed on all backward calls except the very last
+            # (round 0, Step C on rp) because the n rounds share a single computation
+            # graph and freeing it early would break earlier-round backward passes.
+
+            def _zero_like_grad(shape, dt, dev):
+                return torch.zeros(shape, dtype=dt, device=dev)
 
             if not pipeline:
                 if loss is not None:
@@ -854,23 +892,25 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
             else:
                 for r in range(cfg.n_rounds - 1, -1, -1):
                     o = rounds[r]
+                    is_last_backward = (r == 0)   # graph freed after this round's Step C
 
-                    # Step A ── rs: backward through local graph ───────────────
+                    # Step A ── rs: backward through local solver graph ────────
                     if rank == rs:
                         if r == cfg.n_rounds - 1:
                             if loss is not None:
-                                loss.backward()
+                                # retain_graph if more rounds remain; free on round 0
+                                loss.backward(retain_graph=not is_last_backward)
                         else:
                             g_fb = rounds[r + 1].get("g_fb_for_prev")
                             fb   = o.get("feedback")
                             if fb is not None and g_fb is not None:
-                                fb.backward(g_fb)
+                                fb.backward(g_fb, retain_graph=not is_last_backward)
 
                     # Step B ── rs→rc grad ─────────────────────────────────────
                     if rank == rs:
                         sp_recv = o.get("sp_recv")
-                        g = sp_recv.grad if (sp_recv is not None and sp_recv.grad is not None) \
-                            else torch.zeros((1, cfg.latent_steps, SOLVER_DIM), dtype=dtype, device=device)
+                        g = (sp_recv.grad if (sp_recv is not None and sp_recv.grad is not None)
+                             else _zero_like_grad((1, cfg.latent_steps, SOLVER_DIM), dtype, device))
                         _send_tensor(g, dst=rc)
 
                     if rank == rc:
@@ -878,13 +918,13 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                         g = _recv_tensor(src=rs, device=device, dtype=dtype,
                                          shape=(1, cfg.latent_steps, SOLVER_DIM))
                         if sv_pfx is not None:
-                            sv_pfx.backward(g)
+                            sv_pfx.backward(g, retain_graph=not is_last_backward)
 
                     # Step C ── rc→rp grad ─────────────────────────────────────
                     if rank == rc:
                         cp_recv = o.get("cp_recv")
-                        g = cp_recv.grad if (cp_recv is not None and cp_recv.grad is not None) \
-                            else torch.zeros((1, cfg.latent_steps, CRITIC_DIM), dtype=dtype, device=device)
+                        g = (cp_recv.grad if (cp_recv is not None and cp_recv.grad is not None)
+                             else _zero_like_grad((1, cfg.latent_steps, CRITIC_DIM), dtype, device))
                         _send_tensor(g, dst=rp)
 
                     if rank == rp:
@@ -892,14 +932,15 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                         g = _recv_tensor(src=rc, device=device, dtype=dtype,
                                          shape=(1, cfg.latent_steps, CRITIC_DIM))
                         if cr_pfx is not None:
-                            cr_pfx.backward(g)
+                            # Last backward call on rp: free graph after round 0.
+                            cr_pfx.backward(g, retain_graph=not is_last_backward)
 
-                    # Step D ── rp→rs feedback grad (only when r>0) ───────────
+                    # Step D ── rp→rs feedback grad (rounds r>0 only) ──────────
                     if r > 0 and pipeline and rs != rp:
                         if rank == rp:
                             fb_recv = rounds[r - 1].get("fb_recv")
-                            g = fb_recv.grad if (fb_recv is not None and fb_recv.grad is not None) \
-                                else torch.zeros((1, cfg.latent_steps, PLANNER_DIM), dtype=dtype, device=device)
+                            g = (fb_recv.grad if (fb_recv is not None and fb_recv.grad is not None)
+                                 else _zero_like_grad((1, cfg.latent_steps, PLANNER_DIM), dtype, device))
                             _send_tensor(g, dst=rs)
                         if rank == rs:
                             o["g_fb_for_prev"] = _recv_tensor(src=rp, device=device, dtype=dtype,
@@ -1122,7 +1163,8 @@ def parse_args():
     )
     p.add_argument("--n_rounds", type=int, nargs="+", default=[3],
                    help="Recursion rounds. Multiple values → sweep.")
-    p.add_argument("--latent_steps", type=int, default=80)
+    p.add_argument("--latent_steps", type=int, default=48,
+                   help="Latent rollout steps. run.py infers 48 for math500+sequential_light.")
     p.add_argument("--steps", type=int, default=50)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--batch_size", type=int, default=4,
