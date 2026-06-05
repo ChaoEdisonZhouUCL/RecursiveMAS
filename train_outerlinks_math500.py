@@ -675,7 +675,7 @@ def forward_one_round(
                                       add_special_tokens=False).to(device)["input_ids"]
         lm_head = solver_mdl.lm_head                                      # weight-tied, frozen
         # solver_h: (1, latent_steps, d_solver) — project each step to vocab
-        solver_logits = lm_head(solver_h.float()).to(dtype)               # (1, latent_steps, vocab)
+        solver_logits = lm_head(solver_h.to(dtype))                       # (1, latent_steps, vocab)
         out["feedback"]         = feedback
         out["solver_logits"]    = solver_logits
         out["solver_input_ids"] = solver_input_ids
