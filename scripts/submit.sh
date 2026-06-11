@@ -33,11 +33,18 @@ show_help() {
 Usage: ./submit.sh [OPTIONS]
 
 Training options:
-  --n_rounds N          Number of recursion rounds       (default: 3)
-  --latent_steps N      Latent rollout steps per agent   (default: 8)
-  --steps N             Training steps                   (default: 100)
-  --lr LR               Learning rate                    (default: 1e-4)
-  --dtype DTYPE         bfloat16 | float16 | float32     (default: bfloat16)
+  --n_rounds N            Number of recursion rounds              (default: 3)
+  --latent_steps N        Latent rollout steps per agent          (default: 8)
+  --batch_size N          Training batch size                     (default: 4)
+  --steps N               Training steps                          (default: 100)
+  --lr LR                 Learning rate                           (default: 1e-4)
+  --dtype DTYPE           bfloat16 | float16 | float32            (default: bfloat16)
+  --mode MODE             original | shared_roae | compare        (default: original)
+  --n_experts N           MoE experts (shared_roae/compare only)  (default: 4)
+  --expert_dim_divisor N  Expert inner dim divisor                (default: 4)
+  --no_kv_cache           Disable KV cache in latent rollout      (required for latent_steps>=20)
+  --dataset NAME          math500 | s1k | m1k | s1k+m1k (pooled)  (default: math500)
+  --max_seq_len N         Max combined Q+A length in tokens (0=off) (default: 0)
 
 Infrastructure:
   --gpus N              GPUs per SLURM job               (default: 3)
@@ -47,11 +54,14 @@ Infrastructure:
   --slurm_time HH:MM:SS Override time limit
 
 Examples:
-  # Local single-GPU
+  # Local single-GPU, original mode
   ./submit.sh --gpus 1 --n_rounds 3 --steps 50
 
-  # CISPA (auto-detected), 3 GPUs pipeline
-  ./submit.sh --n_rounds 3 --steps 100
+  # CISPA, compare both methods side-by-side
+  ./submit.sh --n_rounds 3 --steps 100 --mode compare
+
+  # CISPA, SharedLink-RoAE only with larger MoE
+  ./submit.sh --n_rounds 3 --steps 100 --mode shared_roae --n_experts 8
 
   # JUWELS
   ./submit.sh --n_rounds 3 --steps 200 --slurm_time 02:00:00
@@ -62,15 +72,22 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --n_rounds)    N_ROUNDS="$2";   shift 2 ;;
-        --latent_steps) LATENT_STEPS="$2"; shift 2 ;;
-        --steps)       STEPS="$2";      shift 2 ;;
-        --lr)          LR="$2";         shift 2 ;;
-        --dtype)       DTYPE="$2";      shift 2 ;;
-        --gpus)        NUM_GPUS="$2";   shift 2 ;;
-        --nodes)       NUM_NODES="$2";  shift 2 ;;
-        --partition)   PARTITION="$2";  shift 2 ;;
-        --container)   CONTAINER="$2";  shift 2 ;;
+        --n_rounds)           N_ROUNDS="$2";           shift 2 ;;
+        --latent_steps)       LATENT_STEPS="$2";       shift 2 ;;
+        --batch_size)         BATCH_SIZE="$2";         shift 2 ;;
+        --steps)              STEPS="$2";              shift 2 ;;
+        --lr)                 LR="$2";                 shift 2 ;;
+        --dtype)              DTYPE="$2";              shift 2 ;;
+        --mode)               MODE="$2";               shift 2 ;;
+        --n_experts)          N_EXPERTS="$2";          shift 2 ;;
+        --expert_dim_divisor) EXPERT_DIM_DIVISOR="$2"; shift 2 ;;
+        --no_kv_cache)        NO_KV_CACHE=true;        shift ;;
+        --dataset)            DATASET="$2";            shift 2 ;;
+        --max_seq_len)        MAX_SEQ_LEN="$2";        shift 2 ;;
+        --gpus)               NUM_GPUS="$2";           shift 2 ;;
+        --nodes)              NUM_NODES="$2";          shift 2 ;;
+        --partition)          PARTITION="$2";          shift 2 ;;
+        --container)          CONTAINER="$2";          shift 2 ;;
         --slurm_time)
             SLURM_TIME[julich]="$2"
             SLURM_TIME[jureca]="$2"
@@ -96,9 +113,16 @@ mkdir -p "${SLURM_JOB_DIR}" "${SLURM_LOG_DIR}"
 TRAIN_CMD="${TRAIN_SCRIPT} \
     --n_rounds ${N_ROUNDS} \
     --latent_steps ${LATENT_STEPS} \
+    --batch_size ${BATCH_SIZE} \
     --steps ${STEPS} \
     --lr ${LR} \
-    --dtype ${DTYPE}"
+    --dtype ${DTYPE} \
+    --mode ${MODE} \
+    --n_experts ${N_EXPERTS} \
+    --expert_dim_divisor ${EXPERT_DIM_DIVISOR} \
+    --dataset ${DATASET} \
+    --max_seq_len ${MAX_SEQ_LEN}"
+[[ "${NO_KV_CACHE}" == "true" ]] && TRAIN_CMD="${TRAIN_CMD} --no_kv_cache"
 
 IS_HPC=false
 [[ "${PLATFORM}" == "cispa" || "${PLATFORM}" == "julich" || "${PLATFORM}" == "jureca" ]] && IS_HPC=true
@@ -113,8 +137,11 @@ $IS_HPC && echo "Mode: HPC — SLURM job" || echo "Mode: local"
 echo "------------------------------------------------------------"
 echo "n_rounds:     ${N_ROUNDS}"
 echo "latent_steps: ${LATENT_STEPS}"
+echo "batch_size:   ${BATCH_SIZE}"
 echo "steps:        ${STEPS}"
 echo "lr:           ${LR}   dtype: ${DTYPE}"
+echo "mode:         ${MODE}  (n_experts=${N_EXPERTS}  expert_dim_divisor=${EXPERT_DIM_DIVISOR})"
+echo "dataset:      ${DATASET}   max_seq_len: ${MAX_SEQ_LEN}"
 echo "GPUs:         ${NUM_GPUS}   nodes: ${NUM_NODES}"
 echo "Script:       ${TRAIN_SCRIPT}"
 echo "============================================================"

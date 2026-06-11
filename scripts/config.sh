@@ -24,19 +24,26 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 NUM_GPUS=3
 NUM_NODES=1
 PARTITION=""
-CONTAINER="projects.cispa.saarland:5005#c01chzh/nanoadam:latest"
+CONTAINER="projects.cispa.saarland:5005#c01chzh/recursivemas_docker:latest"
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
-N_ROUNDS=3
-LATENT_STEPS=8
-STEPS=100
-LR="1e-4"
+N_ROUNDS=2
+LATENT_STEPS=48
+BATCH_SIZE=4
+STEPS=10000
+LR="5e-4"
 DTYPE="bfloat16"
+MODE="original"        # original | shared_roae | compare
+N_EXPERTS=3
+EXPERT_DIM_DIVISOR=3
+NO_KV_CACHE=false          # set true when latent_steps >= 20 (paper uses 80)
+DATASET="s1k+m1k"          # math500 | s1k | m1k | s1k+m1k (pooled)
+MAX_SEQ_LEN=4096              # max combined question+answer length in tokens (0 = no truncation)
 
 # ── HF token ─────────────────────────────────────────────────────────────────
 # Set HF_TOKEN in your environment before running (e.g. export HF_TOKEN=hf_...)
-HF_TOKEN="${HF_TOKEN:-}"
-
+# HF_TOKEN="${HF_TOKEN:-}"
+HF_TOKEN=""
 # ── Per-platform SLURM metadata ───────────────────────────────────────────────
 declare -A SLURM_ACCOUNT=([julich]="hai_1293"     [jureca]="hai_1129")
 declare -A SLURM_PART=(   [julich]="booster"      [jureca]="dc-hwai"   [cispa]="xe8545")

@@ -49,6 +49,8 @@ TRAIN_CMD="${TRAIN_CMD}"
 MASTER_PORT=\$((10000 + RANDOM % 20000))
 echo "Job: \${SLURM_JOB_ID}  Node: \${SLURM_NODELIST}"
 cd "\${PROJ_DIR}"
+JOBTMPDIR=\${PROJ_DIR}/outputs/slurm_logs/job-\${SLURM_JOB_ID}
+mkdir -p "\${JOBTMPDIR}"
 EOF
 
     # ── Runtime body ──────────────────────────────────────────────────────────
@@ -57,13 +59,13 @@ export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=false
 export HF_HOME="${HOME}/CISPA-projects/pt_network-2024/.huggingface_cache"
 export HF_TOKEN="${HF_TOKEN}"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 srun --unbuffered \
      --container-image="${CONTAINER}" \
      --container-mounts="${PROJ_DIR}":/workspace \
-     conda run --no-capture-output -n base bash -c \
-     "pip install -r /workspace/requirements.txt -q && \
-      export MASTER_PORT=${MASTER_PORT} && \
+     conda run --no-capture-output -n recursivemas_env bash -c \
+     "export MASTER_PORT=${MASTER_PORT} && \
       export HF_TOKEN=${HF_TOKEN} && \
       torchrun \
         --nnodes=1 \
@@ -73,6 +75,9 @@ srun --unbuffered \
         ${TRAIN_CMD}"
 
 echo "Job completed."
+mv "${PROJ_DIR}/outputs/slurm_logs/job-${SLURM_JOB_ID}.out" "${JOBTMPDIR}/job-${SLURM_JOB_ID}.out" 2>/dev/null || true
+mv "${PROJ_DIR}/outputs/slurm_logs/job-${SLURM_JOB_ID}.err" "${JOBTMPDIR}/job-${SLURM_JOB_ID}.err" 2>/dev/null || true
+
 SLURM_EOF
 }
 
@@ -146,6 +151,7 @@ export MASTER_ADDR
 
 export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_TOKEN="${HF_TOKEN}"
 export NNODES="${SLURM_NNODES}"
 export GPUS_PER_NODE="${NUM_GPUS_N}"
@@ -157,7 +163,6 @@ echo "Job: ${SLURM_JOB_ID}  Node: ${SLURM_NODELIST}"
 echo "Command: torchrun --nproc_per_node=${GPUS_PER_NODE} ${TRAIN_CMD}"
 echo "============================================================"
 
-pip install -r "${PROJ_DIR}/requirements.txt" -q
 
 if [[ ${SLURM_NNODES} -gt 1 ]]; then
     export NCCL_IB_DISABLE=0
@@ -239,6 +244,7 @@ EOF
     cat >> "$s" << 'SLURM_EOF'
 export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME="/p/home/jusers/zhou17/jureca/hai_1129/pretrain_dynamic_analysis/hf_cache"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -254,7 +260,6 @@ echo "Job: ${SLURM_JOB_ID}  Node: ${SLURM_NODELIST}"
 echo "Command: torchrun --nproc_per_node=${GPUS_PER_NODE} ${TRAIN_CMD}"
 echo "============================================================"
 
-pip install -r "${PROJ_DIR}/requirements.txt" -q
 
 if [[ $SLURM_NNODES -gt 1 ]]; then
     export NCCL_IB_DISABLE=1
