@@ -46,6 +46,7 @@ CONTAINER="${CONTAINER}"
 NUM_GPUS=${NUM_GPUS}
 HF_TOKEN="${HF_TOKEN}"
 TRAIN_CMD="${TRAIN_CMD}"
+IS_EVAL="${EVAL}"
 MASTER_PORT=\$((10000 + RANDOM % 20000))
 echo "Job: \${SLURM_JOB_ID}  Node: \${SLURM_NODELIST}"
 cd "\${PROJ_DIR}"
@@ -61,18 +62,26 @@ export HF_HOME="${HOME}/CISPA-projects/pt_network-2024/.huggingface_cache"
 export HF_TOKEN="${HF_TOKEN}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-srun --unbuffered \
-     --container-image="${CONTAINER}" \
-     --container-mounts="${PROJ_DIR}":/workspace \
-     conda run --no-capture-output -n recursivemas_env bash -c \
-     "export MASTER_PORT=${MASTER_PORT} && \
-      export HF_TOKEN=${HF_TOKEN} && \
-      torchrun \
-        --nnodes=1 \
-        --nproc_per_node=${NUM_GPUS} \
-        --master_addr=127.0.0.1 \
-        --master_port=${MASTER_PORT} \
-        ${TRAIN_CMD}"
+if [[ "${IS_EVAL}" == "true" ]]; then
+    srun --unbuffered \
+         --container-image="${CONTAINER}" \
+         --container-mounts="${PROJ_DIR}":/workspace \
+         conda run --no-capture-output -n recursivemas_env bash -c \
+         "export HF_TOKEN=${HF_TOKEN} && python ${TRAIN_CMD}"
+else
+    srun --unbuffered \
+         --container-image="${CONTAINER}" \
+         --container-mounts="${PROJ_DIR}":/workspace \
+         conda run --no-capture-output -n recursivemas_env bash -c \
+         "export MASTER_PORT=${MASTER_PORT} && \
+          export HF_TOKEN=${HF_TOKEN} && \
+          torchrun \
+            --nnodes=1 \
+            --nproc_per_node=${NUM_GPUS} \
+            --master_addr=127.0.0.1 \
+            --master_port=${MASTER_PORT} \
+            ${TRAIN_CMD}"
+fi
 
 echo "Job completed."
 mv "${PROJ_DIR}/outputs/slurm_logs/job-${SLURM_JOB_ID}.out" "${JOBTMPDIR}/job-${SLURM_JOB_ID}.out" 2>/dev/null || true
@@ -124,6 +133,7 @@ PROJ_DIR="${PROJ_DIR}"
 NUM_GPUS_N=${NUM_GPUS}
 HF_TOKEN="${HF_TOKEN}"
 TRAIN_CMD="${TRAIN_CMD}"
+IS_EVAL="${EVAL}"
 EOF
 
     # HF: booster has no internet → offline mode
@@ -163,6 +173,11 @@ echo "Job: ${SLURM_JOB_ID}  Node: ${SLURM_NODELIST}"
 echo "Command: torchrun --nproc_per_node=${GPUS_PER_NODE} ${TRAIN_CMD}"
 echo "============================================================"
 
+
+if [[ "${IS_EVAL}" == "true" ]]; then
+    python ${TRAIN_CMD}
+    exit $?
+fi
 
 if [[ ${SLURM_NNODES} -gt 1 ]]; then
     export NCCL_IB_DISABLE=0
@@ -233,6 +248,7 @@ PROJ_DIR="${PROJ_DIR}"
 NUM_GPUS=${NUM_GPUS}
 HF_TOKEN="${HF_TOKEN}"
 TRAIN_CMD="${TRAIN_CMD}"
+IS_EVAL="${EVAL}"
 MASTER_ADDR="\$(scontrol show hostnames "\$SLURM_JOB_NODELIST" | head -n 1)"
 MASTER_ADDR="\$(getent ahostsv4 "\${MASTER_ADDR}" | awk 'NR==1{print \$1}')"
 MASTER_PORT=\$((10000 + RANDOM % 20000))
@@ -245,7 +261,7 @@ EOF
 export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME="/p/home/jusers/zhou17/jureca/hai_1129/pretrain_dynamic_analysis/hf_cache"
+export HF_HOME="/p/project1/hai_1354/hf_cache"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
@@ -260,6 +276,11 @@ echo "Job: ${SLURM_JOB_ID}  Node: ${SLURM_NODELIST}"
 echo "Command: torchrun --nproc_per_node=${GPUS_PER_NODE} ${TRAIN_CMD}"
 echo "============================================================"
 
+
+if [[ "${IS_EVAL}" == "true" ]]; then
+    python ${TRAIN_CMD}
+    exit $?
+fi
 
 if [[ $SLURM_NNODES -gt 1 ]]; then
     export NCCL_IB_DISABLE=1

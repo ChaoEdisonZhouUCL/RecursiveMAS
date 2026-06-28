@@ -60,6 +60,14 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Default to the shared project HF cache unless already configured, so model
+# lookups (snapshot_download) find the predownloaded MAS repos whether this
+# script is launched via SLURM (which exports HF_HOME) or directly with
+# `python train_outerlinks_math500.py` for single-GPU runs. Offline mode is
+# left to the caller/environment (e.g. SLURM exports HF_HUB_OFFLINE=1).
+os.environ.setdefault("HF_HOME", "/p/project1/hai_1354/hf_cache")
+os.environ.setdefault("HF_HUB_CACHE", os.environ["HF_HOME"])
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -74,7 +82,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 THIS_DIR = Path(__file__).parent
 sys.path.insert(0, str(THIS_DIR))
 
-from modeling import CrossModelAdapter, OUTER_ADAPTER_TYPE, infer_outer_adapter_type_from_state_dict
+from modeling import (
+    CrossModelAdapter,
+    OUTER_ADAPTER_TYPE,
+    SharedRecursiveLink,
+    infer_outer_adapter_type_from_state_dict,
+)
 from hf_resolver import resolve_inner_adapter, snapshot_repo, task_for_inner_repo
 from prompts import (
     FEEDBACK_SLOT, PLANNER_SLOT, REFINED_SLOT,
@@ -128,117 +141,6 @@ def _init_gloo_group():
 
 import torch.nn as nn
 from typing import List as _List, Tuple as _Tuple
-
-
-def _build_rope_cache(max_idx: int, dim: int, device: torch.device):
-    half = dim // 2
-    k = torch.arange(half, dtype=torch.float32, device=device)
-    theta = 1.0 / (10000.0 ** (2 * k / dim))
-    idx = torch.arange(max_idx + 1, dtype=torch.float32, device=device)
-    angles = torch.outer(idx, theta)
-    return angles.cos(), angles.sin()
-
-
-def _rope_rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-
-
-class SharedRecursiveLink(nn.Module):
-    """
-    Single shared cross-model adapter for all pipeline transitions.
-
-    Architecture:
-      - Per-agent in/out linear projections to/from a shared latent space.
-      - RoAE: apply rotary position encoding with agent index so the shared
-        MoE core can distinguish "planner→critic" from "solver→planner" etc.
-      - Soft-MoE with n_experts experts dispatched by an RoAE-conditioned router.
-      - ReZero gate (alpha): starts as pure skip connection, learns to blend in
-        the MoE update.
-      - Direct skip_proj in native hidden spaces bypasses the shared bottleneck,
-        providing a gradient highway with orthogonal-initialised weights.
-
-    Agents are 1-indexed:  1=Planner, 2=Critic, 3=Solver.
-    """
-
-    N_AGENTS = 3
-
-    def __init__(self, hidden_dims: _List[int], shared_dim: int,
-                 n_experts: int = 4, expert_dim_divisor: int = 4):
-        super().__init__()
-        self.hidden_dims = hidden_dims
-        self.shared_dim  = shared_dim
-        self.n_experts   = n_experts
-        N = len(hidden_dims)
-        d = shared_dim
-
-        # Index 0 is a dummy (agents are 1-indexed); index i → agent i.
-        self.in_proj = nn.ModuleList(
-            [nn.Identity()] + [nn.Linear(h, d) for h in hidden_dims]
-        )
-        self.out_proj = nn.ModuleList(
-            [nn.Identity()] + [nn.Linear(d, h) for h in hidden_dims]
-        )
-        # Direct skip in native hidden space for gradient highway.
-        self.skip_proj = nn.ModuleList([
-            nn.ModuleList([
-                nn.Linear(hidden_dims[i], hidden_dims[j], bias=False)
-                for j in range(N)
-            ])
-            for i in range(N)
-        ])
-        for i in range(N):
-            for j in range(N):
-                nn.init.orthogonal_(self.skip_proj[i][j].weight)
-
-        self.router   = nn.Linear(3 * d, n_experts, bias=False)
-        exp_hidden = max(1, d // expert_dim_divisor)
-        # Fused weight tensors: one matmul covers all experts simultaneously.
-        # Shape: (n_experts, d, exp_hidden) and (n_experts, exp_hidden, d)
-        self.expert_W1 = nn.Parameter(torch.empty(n_experts, d, exp_hidden))
-        self.expert_b1 = nn.Parameter(torch.zeros(n_experts, exp_hidden))
-        self.expert_W2 = nn.Parameter(torch.zeros(n_experts, exp_hidden, d))
-        self.expert_b2 = nn.Parameter(torch.zeros(n_experts, d))
-        nn.init.kaiming_uniform_(self.expert_W1, a=math.sqrt(5))
-
-        self.act   = nn.GELU()
-        self.ln_in = nn.LayerNorm(d)
-        self.alpha = nn.Parameter(torch.tensor(1e-3))
-
-        self._rope_cache: dict = {}   # keyed by (device, dtype)
-
-    def _get_rope(self, device, dtype):
-        key = (device, dtype)
-        if key not in self._rope_cache:
-            cos, sin = _build_rope_cache(self.N_AGENTS, self.shared_dim, device)
-            self._rope_cache[key] = (cos.to(dtype), sin.to(dtype))
-        return self._rope_cache[key]
-
-    def forward(self, h: torch.Tensor, src: int, dst: int) -> torch.Tensor:
-        """h: (B, T, hidden_dims[src-1]);  src/dst are 1-indexed agent indices."""
-        src0, dst0 = src - 1, dst - 1
-        skip = self.skip_proj[src0][dst0](h)
-
-        x = self.in_proj[src](h)
-        cos_tab, sin_tab = self._get_rope(x.device, x.dtype)
-        x_src = _rope_rotate(x, cos_tab[src], sin_tab[src])
-        x_dst = _rope_rotate(x, cos_tab[dst], sin_tab[dst])
-
-        gate_input = torch.cat([x_src, x_dst, x_dst - x_src], dim=-1)
-        logits = self.router(gate_input.mean(dim=1))           # (B, n_experts)
-        w = torch.softmax(logits / 2.0, dim=-1).unsqueeze(1)  # (B, 1, n_experts)
-
-        normed = self.ln_in(x_src)           # (B, T, d)
-        W1 = self.expert_W1.to(normed.dtype)  # (K, d, e)
-        b1 = self.expert_b1.to(normed.dtype)  # (K, e)
-        W2 = self.expert_W2.to(normed.dtype)  # (K, e, d)
-        b2 = self.expert_b2.to(normed.dtype)  # (K, d)
-        # h1: (B, T, K, e)  — all experts in one batched matmul
-        h1 = self.act(torch.einsum("btd,kde->btke", normed, W1) + b1)
-        h2 = torch.einsum("btke,ked->btd", h1 * w.unsqueeze(-1), W2) + (w @ b2).squeeze(1).unsqueeze(1)
-        return skip + self.alpha * self.out_proj[dst](h2)
-
 
 # ── Pipeline layout ──────────────────────────────────────────────────────────
 # With world_size >= 3: rank 0 = Planner, rank 1 = Critic, rank 2 = Solver.
@@ -315,8 +217,58 @@ def load_inner_adapter(repo_id: str, hidden: int, device: torch.device, dtype: t
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
 
+DATA_RAW_DIR = THIS_DIR / "data" / "raw"
+
+
+def _load_local_or_hub(local_key: str, repo_id: str, split: str):
+    """
+    Load a dataset from data/raw/<local_key>/**/*.parquet if predownloaded
+    (see download_datasets.py), else fall back to the Hub repo (requires
+    network / HF_HUB_OFFLINE unset).
+
+    OpenCodeReasoning ships two sub-splits (split_0, split_1) with different
+    schemas (split_1 has an extra `index` column).  Loading all parquet files
+    together with a single inferred schema causes a CastError.  We handle this
+    by grouping files per immediate sub-directory and concatenating the
+    resulting datasets, which lets each group infer its own schema independently.
+    """
+    local_dir = DATA_RAW_DIR / local_key
+    parquet_files = sorted(str(p) for p in local_dir.rglob("*.parquet"))
+    if not parquet_files:
+        return load_dataset(repo_id, split=split, token=HF_TOKEN)
+
+    # Group by immediate sub-directory so different sub-splits with different
+    # schemas (e.g. OpenCodeReasoning split_0 vs split_1) are loaded separately.
+    from collections import defaultdict as _defaultdict
+    from datasets import concatenate_datasets as _concat
+    groups: dict = _defaultdict(list)
+    for pf in parquet_files:
+        subdir = Path(pf).parent
+        groups[subdir].append(pf)
+
+    shards = []
+    for subdir_files in groups.values():
+        shard = load_dataset("parquet", data_files=sorted(subdir_files), split="train")
+        shards.append(shard)
+
+    if len(shards) == 1:
+        return shards[0]
+
+    # Keep only the intersection of column names so that sub-splits with
+    # different schemas (e.g. OpenCodeReasoning split_0 vs split_1 where
+    # split_1 has an extra `index` column) can be concatenated without a
+    # CastError.  All downstream loaders access only named fields, so
+    # dropping extra columns is safe.
+    common_cols = set(shards[0].column_names)
+    for s in shards[1:]:
+        common_cols &= set(s.column_names)
+    common_cols = sorted(common_cols)  # deterministic order
+    shards = [s.select_columns(common_cols) for s in shards]
+    return _concat(shards)
+
+
 def load_math500(n_samples: int = 0, seed: int = 42):
-    ds = load_dataset("HuggingFaceH4/MATH-500", split="test", token=HF_TOKEN)
+    ds = _load_local_or_hub("math500", "HuggingFaceH4/MATH-500", split="test")
     if n_samples > 0:
         ds = ds.shuffle(seed=seed).select(range(min(n_samples, len(ds))))
     return [(row["problem"], row["answer"]) for row in ds]
@@ -324,7 +276,7 @@ def load_math500(n_samples: int = 0, seed: int = 42):
 
 def load_s1k(n_samples: int = 0, seed: int = 42):
     """s1K: reasoning-trace dataset — fields `question` (prompt) and `solution` (target)."""
-    ds = load_dataset("simplescaling/s1K", split="train", token=HF_TOKEN)
+    ds = _load_local_or_hub("s1k", "simplescaling/s1K", split="train")
     if n_samples > 0:
         ds = ds.shuffle(seed=seed).select(range(min(n_samples, len(ds))))
     return [(row["question"], row["solution"]) for row in ds]
@@ -332,31 +284,83 @@ def load_s1k(n_samples: int = 0, seed: int = 42):
 
 def load_m1k(n_samples: int = 0, seed: int = 42):
     """m1k-tokenized: medical-QA reasoning dataset — fields `prompt` and `distilled_answer_string`."""
-    ds = load_dataset("UCSC-VLAA/m1k-tokenized", split="train", token=HF_TOKEN)
+    ds = _load_local_or_hub("m1k", "UCSC-VLAA/m1k-tokenized", split="train")
     if n_samples > 0:
         ds = ds.shuffle(seed=seed).select(range(min(n_samples, len(ds))))
     return [(row["prompt"], row["distilled_answer_string"]) for row in ds]
 
 
+def load_opencodereasoning(n_samples: int = 0, seed: int = 42):
+    """OpenCodeReasoning (split_1): competitive-programming dataset — fields `input` and `solution`."""
+    ds = _load_local_or_hub("opencodereasoning", "nvidia/OpenCodeReasoning", split="train")
+    if n_samples > 0:
+        ds = ds.shuffle(seed=seed).select(range(min(n_samples, len(ds))))
+    return [(row["input"], row["solution"]) for row in ds]
+
+
+def load_arpo_sft(n_samples: int = 0, seed: int = 42):
+    """ARPO-SFT-54K: agentic reasoning SFT dataset stored as JSONL with `conversations` field.
+
+    Each entry has a list of {from, value} turns; the first human turn is used as the
+    question and the first assistant turn is used as the answer.
+    """
+    import json as _json
+    local_dir = DATA_RAW_DIR / "arpo_sft"
+    jsonl_files = sorted(local_dir.rglob("*.jsonl"))
+    if jsonl_files:
+        rows = []
+        for jf in jsonl_files:
+            with open(jf, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        rows.append(_json.loads(line))
+    else:
+        ds = load_dataset("dongguanting/ARPO-SFT-54K", split="train", token=HF_TOKEN)
+        rows = list(ds)
+
+    pairs = []
+    for row in rows:
+        convs = row.get("conversations", [])
+        human_turn = next((c["value"] for c in convs if c.get("from") == "human"), None)
+        assistant_turn = next((c["value"] for c in convs if c.get("from") in ("gpt", "assistant")), None)
+        if human_turn and assistant_turn:
+            pairs.append((human_turn, assistant_turn))
+
+    if n_samples > 0:
+        rng = np.random.default_rng(seed)
+        idxs = rng.permutation(len(pairs))[:n_samples]
+        pairs = [pairs[i] for i in idxs]
+    return pairs
+
+
 DATASET_LOADERS = {
-    "math500": load_math500,
-    "s1k":     load_s1k,
-    "m1k":     load_m1k,
+    "math500":           load_math500,
+    "s1k":               load_s1k,
+    "m1k":               load_m1k,
+    "opencodereasoning": load_opencodereasoning,
+    "arpo_sft":          load_arpo_sft,
 }
 
 
 def load_training_problems(name: str, n_samples: int = 0, seed: int = 42):
     """
     Dispatch to the right loader by name. `name` may be a single dataset
-    ("s1k", "m1k", "math500") or a "+"-joined combination ("s1k+m1k"), in
+    ("s1k", "m1k", "math500", "opencodereasoning", "arpo_sft") or a "+"-joined
+    combination ("s1k+m1k+opencodereasoning+arpo_sft"), in
     which case samples are pooled and the combined pool is shuffled.
+
+    Returns a list of (question, answer, source_key) triples so that downstream
+    truncation can apply per-sample strategies (e.g. filter code vs. tail-preserve
+    math).  Call strip_source() on the result when source tags are no longer needed.
     """
     keys = [k.strip().lower() for k in name.split("+") if k.strip()]
     pools = []
     for k in keys:
         if k not in DATASET_LOADERS:
             raise ValueError(f"Unknown dataset '{k}'. Choices: {sorted(DATASET_LOADERS)}")
-        pools.append(DATASET_LOADERS[k](n_samples=0, seed=seed))   # load full pool, truncate after merge
+        pairs = DATASET_LOADERS[k](n_samples=0, seed=seed)  # load full pool, truncate after merge
+        pools.append([(q, a, k) for q, a in pairs])
 
     combined = [p for pool in pools for p in pool]
     rng = np.random.default_rng(seed)
@@ -366,22 +370,92 @@ def load_training_problems(name: str, n_samples: int = 0, seed: int = 42):
     return combined
 
 
-def truncate_problems_by_tokens(problems, max_seq_len: int, chars_per_token: float = 4.0):
+def strip_source(problems) -> List[Tuple[str, str]]:
+    """Drop the source-key tag added by load_training_problems."""
+    return [(q, a) for q, a, *_ in problems]
+
+
+_CODE_DATASETS = frozenset({"opencodereasoning"})
+
+
+def truncate_problems_by_tokens(
+    problems,
+    max_seq_len: int,
+    dataset_name: str = "",
+    chars_per_token: float = 4.0,
+    max_prompt_fraction: float = 0.4,
+):
     """
-    Drop / trim (question, answer) pairs so the combined length stays within
-    `max_seq_len` tokens. Uses a character-count proxy (≈ chars_per_token chars
-    per token) so the result is identical on every rank regardless of which
-    agent tokenizer it happens to have loaded — exact tokenizer-based lengths
-    would differ slightly per agent and could desync the shared problem list.
-    Long answers are truncated; questions are kept whole (truncating the
-    prompt would break the agent prompt templates).
+    Enforce L_prompt + L_target ≤ max_seq_len (approximated via char counts).
+
+    `problems` is a list of either (q, a) pairs or (q, a, src) triples.
+    When src is present it is used to select the per-sample strategy; when
+    absent, dataset_name is used as a fallback to identify the active keys.
+
+    Strategy differs by data type to avoid destroying useful signal:
+
+    Math / medical / agentic  (math500, s1k, m1k, arpo_sft)
+      The decisive answer typically lives at the *end* of the target string
+      (final boxed result, conclusion, etc.).  When the target must be
+      shortened we therefore keep the *tail* rather than the head:
+        1. Prompt is capped at max_prompt_fraction × budget_chars (default 40 %).
+           If it exceeds the cap it is truncated from the right (the question
+           itself is at the start, which is more critical than the tail).
+        2. The remaining chars go to the target.  If the target still exceeds
+           the allocation we keep its last target_budget chars (tail-preserve).
+        3. Samples whose prompt alone exceeds the full budget are dropped.
+
+    Code  (opencodereasoning)
+      Truncating executable code almost always produces syntactically broken
+      programs that contribute zero useful loss. We therefore *filter* any
+      sample whose combined char length exceeds the budget rather than
+      truncating it.
+
+    Uses a character-count proxy so the result is identical on every rank
+    regardless of which agent tokenizer is loaded.
     """
     budget_chars = int(max_seq_len * chars_per_token)
+    max_prompt_chars = int(budget_chars * max_prompt_fraction)
+
+    # Fallback: if problems have no src tag, infer code-only from dataset_name.
+    active_keys = {k.strip().lower() for k in dataset_name.split("+")} if dataset_name else set()
+    fallback_is_code = bool(active_keys) and active_keys.issubset(_CODE_DATASETS)
+
     out = []
-    for q, a in problems:
-        if len(q) >= budget_chars:
-            continue   # question alone exceeds budget — skip
-        out.append((q, a[:budget_chars - len(q)]))
+    for entry in problems:
+        if len(entry) == 3:
+            q, a, src = entry
+            is_code = src in _CODE_DATASETS
+        else:
+            q, a = entry
+            src = ""
+            is_code = fallback_is_code
+
+        q_chars = len(q)
+        a_chars = len(a)
+
+        if q_chars >= budget_chars:
+            continue  # prompt alone exceeds budget — drop
+
+        if is_code:
+            # Code: keep only samples that fit whole; drop the rest.
+            if q_chars + a_chars <= budget_chars:
+                out.append((q, a, src) if src else (q, a))
+            # else: drop — truncated code is not useful
+            continue
+
+        # Math / medical / agentic: tail-preserving truncation.
+        q_budget = min(q_chars, max_prompt_chars)
+        q_trimmed = q if q_chars <= q_budget else q[:q_budget]
+
+        target_budget = budget_chars - len(q_trimmed)
+        if a_chars <= target_budget:
+            out.append((q_trimmed, a, src) if src else (q_trimmed, a))
+        else:
+            # Keep the tail of the answer — it contains the decisive result.
+            out.append((q_trimmed, a[a_chars - target_budget:], src) if src else
+                       (q_trimmed, a[a_chars - target_budget:]))
+
     return out
 
 
@@ -504,6 +578,73 @@ def _build_input_embeds_batch(
     am_batch = torch.stack(padded_am, dim=0).long()
 
     return ie_batch, am_batch
+
+
+def _build_teacher_forced_batch(
+    tokenizer, embed_fn,
+    pre_list: List[str], post_list: List[str],
+    latent: Optional[torch.Tensor],   # (B, L_lat, d) or None
+    answers: List[str],
+    device: torch.device, dtype: torch.dtype,
+):
+    """
+    Like _build_input_embeds_batch, but additionally appends each sample's
+    answer tokens after [pre][latent][post] (right-padded to a common length)
+    so the model can be teacher-forced on the full prompt+answer sequence in
+    one forward pass.
+
+    Layout per sample: [PAD...][pre][latent][post][answer tokens][PAD...]
+    Left padding covers the prompt (as in _build_input_embeds_batch); the
+    answer segment is right-padded so every sample's answer starts at the
+    same column (T_prompt_max).
+
+    Returns:
+        ie     : (B, T_prompt_max + A_max, d) — input embeddings
+        am     : (B, T_prompt_max + A_max)    — attention mask
+        labels : (B, T_prompt_max + A_max)    — token ids for answer positions,
+                                                  -100 (ignore) elsewhere
+        T_prompt_max : int — column where each sample's answer begins
+    """
+    ie_prompt, am_prompt = _build_input_embeds_batch(
+        tokenizer, embed_fn, pre_list, post_list, latent, device, dtype,
+    )
+    B, T_prompt_max, d_model = ie_prompt.shape
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    ans_ids_list = []
+    for ans in answers:
+        ids = tokenizer(ans, return_tensors="pt", add_special_tokens=False).to(device)["input_ids"][0]
+        eos_id = tokenizer.eos_token_id
+        if eos_id is not None:
+            ids = torch.cat([ids, ids.new_tensor([eos_id])])
+        ans_ids_list.append(ids)
+
+    A_max = max(ids.size(0) for ids in ans_ids_list)
+
+    ans_emb = []
+    ans_am  = []
+    ans_lbl = []
+    for ids in ans_ids_list:
+        A = ids.size(0)
+        pad_len = A_max - A
+        with torch.no_grad():
+            emb = embed_fn(ids.unsqueeze(0)).to(dtype)[0]   # (A, d)
+        ans_emb.append(F.pad(emb, (0, 0, 0, pad_len)))
+        ans_am.append(F.pad(ids.new_ones((A,)), (0, pad_len)).to(am_prompt.dtype))
+        ans_lbl.append(F.pad(ids, (0, pad_len), value=-100))
+
+    ans_emb = torch.stack(ans_emb, dim=0)   # (B, A_max, d)
+    ans_am  = torch.stack(ans_am,  dim=0)   # (B, A_max)
+    ans_lbl = torch.stack(ans_lbl, dim=0)   # (B, A_max)
+
+    ie = torch.cat([ie_prompt, ans_emb], dim=1)
+    am = torch.cat([am_prompt, ans_am],  dim=1)
+    labels = torch.cat(
+        [am_prompt.new_full((B, T_prompt_max), -100), ans_lbl], dim=1,
+    )
+    return ie, am, labels, T_prompt_max
 
 
 # ── Latent rollout ────────────────────────────────────────────────────────────
@@ -694,6 +835,8 @@ def forward_one_round(
     round_idx: int = 0,
     shared_link: Optional["SharedRecursiveLink"] = None,
     debug: bool = False,
+    is_last_round: bool = False,
+    keep_solver_logits: bool = False,
 ):
     """
     One Planner→Critic→Solver forward round (paper §3-4, Fig.1).
@@ -727,26 +870,18 @@ def forward_one_round(
             planner_tok, planner_mdl.get_input_embeddings(),
             pre_list, post_list, feedback_prefix, device, dtype,
         )
-        if debug:
-            print(f"[dbg fwd r{round_idx} Planner] theoretical ie=(B={B}, T=?, d={PLANNER_DIM})  "
-                  f"practical ie={tuple(ie.shape)}  am={tuple(am.shape)}  "
-                  f"feedback_prefix={'None' if feedback_prefix is None else tuple(feedback_prefix.shape)}")
         planner_h, _, _ = latent_rollout(planner_mdl, planner_inner, ie, am, latent_steps, dtype,
                                          agent_idx=1, shared_link=shared_link)
-        if debug:
-            print(f"[dbg fwd r{round_idx} Planner] theoretical planner_h=(B={B}, latent_steps={latent_steps}, d={PLANNER_DIM})  "
-                  f"practical planner_h={tuple(planner_h.shape)}  requires_grad={planner_h.requires_grad}")
+        del ie, am   # free prompt embeddings; only planner_h is needed going forward
         if shared_link is not None:
             critic_prefix = shared_link(planner_h, src=1, dst=2)
         else:
             critic_prefix = outer_12(planner_h)
+        del planner_h
         if monitor is not None:
             monitor.register_output(critic_prefix, round_idx)
         if critic_prefix.requires_grad:
             critic_prefix.retain_grad()
-        if debug:
-            print(f"[dbg fwd r{round_idx} Planner] theoretical critic_prefix=(B={B}, latent_steps={latent_steps}, d={CRITIC_DIM})  "
-                  f"practical critic_prefix={tuple(critic_prefix.shape)}  requires_grad={critic_prefix.requires_grad}")
         out["critic_prefix"] = critic_prefix
         if pipeline:
             _send_tensor(critic_prefix, dst=rc)
@@ -767,21 +902,16 @@ def forward_one_round(
             critic_tok, critic_mdl.get_input_embeddings(),
             pre_c_list, post_c_list, critic_prefix, device, dtype,
         )
-        if debug:
-            print(f"[dbg fwd r{round_idx} Critic] theoretical critic_input=(B={B}, T=?, d={CRITIC_DIM})  "
-                  f"practical critic_input={tuple(critic_input.shape)}  am={tuple(critic_am.shape)}  "
-                  f"critic_prefix={tuple(critic_prefix.shape)}  requires_grad={critic_prefix.requires_grad}")
         critic_h, _, _ = latent_rollout(critic_mdl, critic_inner, critic_input, critic_am,
                                         latent_steps, dtype, agent_idx=2, shared_link=shared_link)
+        del critic_input, critic_am   # free prompt embeddings
         if shared_link is not None:
             solver_prefix = shared_link(critic_h, src=2, dst=3)
         else:
             solver_prefix = outer_23(critic_h)
+        del critic_h
         if solver_prefix.requires_grad:
             solver_prefix.retain_grad()
-        if debug:
-            print(f"[dbg fwd r{round_idx} Critic] theoretical solver_prefix=(B={B}, latent_steps={latent_steps}, d={SOLVER_DIM})  "
-                  f"practical solver_prefix={tuple(solver_prefix.shape)}  requires_grad={solver_prefix.requires_grad}")
         out["solver_prefix_rc"] = solver_prefix
         if pipeline and rc != rs:
             _send_tensor(solver_prefix, dst=rs)
@@ -794,68 +924,84 @@ def forward_one_round(
         out["sp_recv"] = sp_recv
         solver_prefix  = sp_recv
 
-    # ── Stage 3: Solver runs, produces feedback and logits ───────────────────
+    # ── Stage 3: Solver ───────────────────────────────────────────────────────
+    #   non-final round → latent rollout → outer_31 → feedback to Planner
+    #   final round     → teacher-forced on [prompt][answer] → CE vs y (paper Eq.6)
     if rank == rs:
         pre_s_list  = [build_solver_prompt(q)[0] for q in questions]
         post_s_list = [build_solver_prompt(q)[1] for q in questions]
-        solver_input, solver_am = _build_input_embeds_batch(
-            solver_tok, solver_mdl.get_input_embeddings(),
-            pre_s_list, post_s_list, solver_prefix, device, dtype,
-        )
-        if debug:
-            print(f"[dbg fwd r{round_idx} Solver] theoretical solver_input=(B={B}, T=?, d={SOLVER_DIM})  "
-                  f"practical solver_input={tuple(solver_input.shape)}  am={tuple(solver_am.shape)}  "
-                  f"solver_prefix={tuple(solver_prefix.shape)}  requires_grad={solver_prefix.requires_grad}")
-        solver_h, _, _ = latent_rollout(
-            solver_mdl, solver_inner, solver_input, solver_am, latent_steps, dtype,
-            agent_idx=3, shared_link=shared_link,
-        )
-        if shared_link is not None:
-            feedback = shared_link(solver_h, src=3, dst=1)
-        else:
-            feedback = outer_31(solver_h)
-        if feedback.requires_grad:
-            feedback.retain_grad()
-        if debug:
-            print(f"[dbg fwd r{round_idx} Solver] theoretical solver_h=(B={B}, latent_steps={latent_steps}, d={SOLVER_DIM})  "
-                  f"practical solver_h={tuple(solver_h.shape)}  "
-                  f"feedback theoretical=(B={B}, latent_steps={latent_steps}, d={PLANNER_DIM})  "
-                  f"practical feedback={tuple(feedback.shape)}  requires_grad={feedback.requires_grad}")
 
-        # CE loss: the LAST A predicted positions align with the A answer tokens
-        # (solver_h[:, -A:, :] predicts answer token y[-A:]) — paper Eq.6.
-        # Compute per-sample CE and average over the batch.
-        final_norm    = getattr(getattr(solver_mdl, "model", solver_mdl), "norm", None)
-        normed_h      = final_norm(solver_h.to(dtype)) if final_norm is not None else solver_h.to(dtype)
-        solver_logits = solver_mdl.lm_head(normed_h)   # (B, latent_steps, vocab)
-        if debug:
-            print(f"[dbg fwd r{round_idx} Solver] theoretical solver_logits=(B={B}, latent_steps={latent_steps}, vocab=?)  "
-                  f"practical solver_logits={tuple(solver_logits.shape)}")
-
-        loss_sum = torch.tensor(0.0, device=device, dtype=torch.float32)
-        for i, ans in enumerate(answers):
-            ans_ids = solver_tok(ans, return_tensors="pt",
-                                 add_special_tokens=False).to(device)["input_ids"]
-            L = solver_logits.size(1)
-            A = ans_ids.size(1)
-            n = min(L, A)
-            if debug:
-                print(f"[dbg fwd r{round_idx} Solver] sample {i}: theoretical loss window n=min(L={L}, A={A})={n}  "
-                      f"logits slice=[{L - n}:{L}]  answer slice=[{A - n}:{A}]  "
-                      f"practical logits_slice_shape={tuple(solver_logits[i, L - n:].shape)}  "
-                      f"answer_slice_shape={tuple(ans_ids[0, A - n:].shape)}")
-            loss_sum = loss_sum + F.cross_entropy(
-                solver_logits[i, L - n:].float(),
-                ans_ids[0, A - n:],
+        if is_last_round:
+            solver_input, solver_am, labels, T_prompt = _build_teacher_forced_batch(
+                solver_tok, solver_mdl.get_input_embeddings(),
+                pre_s_list, post_s_list, solver_prefix, answers, device, dtype,
             )
-        solver_loss = loss_sum / B
-        if debug:
-            print(f"[dbg fwd r{round_idx} Solver] theoretical solver_loss=scalar mean-over-B(B={B})  "
-                  f"practical solver_loss={solver_loss.item():.4f}  requires_grad={solver_loss.requires_grad}")
+            A_max = labels.shape[1] - T_prompt   # number of answer columns
 
-        out["feedback"]     = feedback
-        out["solver_logits"] = solver_logits
-        out["solver_loss"]   = solver_loss
+            # Pass logits_to_keep=A_max so the model only materialises logits
+            # for the answer positions (last A_max columns).  This avoids
+            # allocating a (B, T_prompt+A_max, vocab) tensor — the leading
+            # T_prompt logits are never used for the loss and are the main
+            # cause of CUDA OOM at long sequence lengths.
+            try:
+                sol_out = solver_mdl(inputs_embeds=solver_input, attention_mask=solver_am,
+                                     use_cache=False, return_dict=True,
+                                     logits_to_keep=A_max + 1)   # +1: last prompt token predicts first answer token
+            except TypeError:
+                sol_out = solver_mdl(inputs_embeds=solver_input, attention_mask=solver_am,
+                                     use_cache=False, return_dict=True)
+
+            # Free input tensors immediately — not needed for backward.
+            del solver_input, solver_am
+
+            logits = sol_out.logits   # (B, A_max+1, vocab) with logits_to_keep, else (B, T+A, vocab)
+            del sol_out
+
+            if logits.shape[1] == A_max + 1:
+                # logits_to_keep path: logits[b, 0] predicts answer_token[0],
+                # logits[b, i] predicts answer_token[i].
+                shift_logits = logits[:, :-1, :].float()   # (B, A_max, vocab)
+                shift_labels = labels[:, T_prompt:]        # (B, A_max)
+            else:
+                # Fallback: full logit tensor (no logits_to_keep support).
+                shift_logits = logits[:, :-1, :].float()
+                shift_labels = labels[:, 1:]
+
+            solver_loss = F.cross_entropy(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                shift_labels.reshape(-1),
+                ignore_index=-100,
+            )
+            del shift_logits  # free immediately after loss is computed
+
+            # Only store full logits when the caller needs them (eval probe).
+            # During normal training steps this avoids keeping a large
+            # (B, T+A, vocab) tensor alive across all n_rounds.
+            if keep_solver_logits:
+                out["solver_logits"] = logits
+                out["t_prompt"]      = T_prompt
+            del logits
+
+            out["solver_loss"]   = solver_loss
+        else:
+            solver_input, solver_am = _build_input_embeds_batch(
+                solver_tok, solver_mdl.get_input_embeddings(),
+                pre_s_list, post_s_list, solver_prefix, device, dtype,
+            )
+            solver_h, _, _ = latent_rollout(
+                solver_mdl, solver_inner, solver_input, solver_am, latent_steps, dtype,
+                agent_idx=3, shared_link=shared_link,
+            )
+            del solver_input, solver_am   # free prompt embeddings before outer link
+            if shared_link is not None:
+                feedback = shared_link(solver_h, src=3, dst=1)
+            else:
+                feedback = outer_31(solver_h)
+            if feedback.requires_grad:
+                feedback.retain_grad()
+            del solver_h
+
+            out["feedback"] = feedback
 
     return out
 
@@ -1110,6 +1256,8 @@ def eval_probe(
                 monitor=None,
                 round_idx=r,
                 shared_link=shared_link,
+                is_last_round=(r == n_rounds - 1),
+                keep_solver_logits=True,   # eval_probe needs logits to decode
             )
             if r < n_rounds - 1:
                 pipeline = _is_dist() and (rp != rc or rc != rs)
@@ -1126,10 +1274,19 @@ def eval_probe(
                     feedback_prefix = out.get("feedback")
 
         if rank == rs and solver_mdl is not None:
-            solver_logits = out.get("solver_logits")   # (1, latent_steps, vocab)
+            solver_logits = out.get("solver_logits")
+            t_prompt = out.get("t_prompt")
             if solver_logits is not None:
-                n_show   = min(latent_steps, max_new_tokens)
-                pred_ids = solver_logits[0, :n_show].argmax(dim=-1).tolist()
+                T_logits = solver_logits.size(1)
+                if t_prompt is not None and T_logits > t_prompt:
+                    # Full-logits fallback (logits_to_keep not supported):
+                    # logits[t] predicts token t+1; first answer pred is at t_prompt-1.
+                    start = t_prompt - 1
+                else:
+                    # logits_to_keep path: logits[0] already predicts first answer token.
+                    start = 0
+                n_show   = min(max_new_tokens, T_logits - start)
+                pred_ids = solver_logits[0, start:start + n_show].argmax(dim=-1).tolist()
                 generated = solver_tok.decode(pred_ids, skip_special_tokens=True)
             else:
                 generated = "<no output>"
@@ -1172,6 +1329,7 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     if rank == rp:
         if rank == 0: print("Loading Planner...")
         planner_mdl, planner_tok = load_model_and_tokenizer(PLANNER_REPO, device, dtype)
+        # planner_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         if mode != "shared_roae":
             planner_inner = load_inner_adapter(PLANNER_REPO, PLANNER_DIM, device, dtype)
             for p in planner_inner.parameters(): p.requires_grad_(False)
@@ -1179,6 +1337,7 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     if rank == rc:
         if rank == 0: print("Loading Critic...")
         critic_mdl, critic_tok = load_model_and_tokenizer(CRITIC_REPO, device, dtype)
+        # critic_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         if mode != "shared_roae":
             critic_inner = load_inner_adapter(CRITIC_REPO, CRITIC_DIM, device, dtype)
             for p in critic_inner.parameters(): p.requires_grad_(False)
@@ -1186,6 +1345,7 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     if rank == rs:
         if rank == 0: print("Loading Solver...")
         solver_mdl, solver_tok = load_model_and_tokenizer(SOLVER_REPO, device, dtype)
+        # solver_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         if mode != "shared_roae":
             solver_inner = load_inner_adapter(SOLVER_REPO, SOLVER_DIM, device, dtype)
             for p in solver_inner.parameters(): p.requires_grad_(False)
@@ -1262,19 +1422,15 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     max_seq_len = getattr(cfg, "max_seq_len", 0)
     if max_seq_len > 0:
         n_before = len(problems)
-        problems = truncate_problems_by_tokens(problems, max_seq_len)
+        problems = truncate_problems_by_tokens(problems, max_seq_len, dataset_name=dataset_name)
         if rank == 0:
-            print(f"  Truncated to max_seq_len={max_seq_len}: {n_before} -> {len(problems)} problems.")
+            print(f"  Filtered/truncated to max_seq_len={max_seq_len}: {n_before} -> {len(problems)} problems.")
+
+    # Drop source tags — downstream code unpacks (question, answer) pairs only.
+    problems = strip_source(problems)
 
     if rank == 0:
         print(f"  Loaded {len(problems)} problems.")
-
-    # Fix a single probe example for qualitative eval throughout training.
-    # Use the first problem in the shuffled dataset (deterministic across runs).
-    probe_question, probe_answer = problems[1]
-    if rank == 0:
-        print(f"\n  Probe question: {probe_question[:120]}{'...' if len(probe_question) > 120 else ''}")
-        print(f"  Probe answer  : {probe_answer[:80]}{'...' if len(probe_answer) > 80 else ''}")
 
     _barrier()
 
@@ -1282,38 +1438,6 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     losses: List[float] = []
     monitor = GradMonitor(cfg.n_rounds) if rank == rp else None
     rng     = np.random.default_rng(cfg.seed)
-
-    # Probe log: one file per (mode, n_rounds) run, written by rank==rs only.
-    out_prefix     = getattr(cfg, "out_prefix", "outerlink_grad")
-    probe_log_file = f"{out_prefix}_{mode}_r{cfg.n_rounds}_probe.txt"
-    # Write header once (truncate any prior file from a rerun).
-    if rank == rs:
-        with open(probe_log_file, "w") as f:
-            f.write(f"Eval probe log  |  mode={mode}  n_rounds={cfg.n_rounds}"
-                    f"  latent_steps={cfg.latent_steps}  steps={cfg.steps}\n")
-            f.write(f"Q : {probe_question}\n")
-            f.write(f"GT: {probe_answer}\n")
-            f.write("=" * 64 + "\n")
-
-    # Pretrained baseline: run once before training using the original (unmodified)
-    # outer adapters.  Works in both single-GPU and pipeline mode — each rank
-    # executes only the stage it owns; tensors are passed via NCCL P2P inside.
-    outer_dir_path = Path(snapshot_repo(OUTER_REPO))
-    pretrained_inference_probe(
-        question=probe_question,
-        answer=probe_answer,
-        planner_mdl=planner_mdl, planner_tok=planner_tok,
-        critic_mdl=critic_mdl,   critic_tok=critic_tok,
-        solver_mdl=solver_mdl,   solver_tok=solver_tok,
-        planner_inner=planner_inner, critic_inner=critic_inner, solver_inner=solver_inner,
-        outer_dir=outer_dir_path,
-        latent_steps=cfg.latent_steps,
-        n_rounds=cfg.n_rounds,
-        max_new_tokens=256,
-        device=device,
-        dtype=dtype,
-        probe_log_file=probe_log_file,
-    )
 
     if rank == 0:
         print(f"\n{'='*70}")
@@ -1328,29 +1452,7 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     def _zero_like_grad(shape, dt, dev):
         return torch.zeros(shape, dtype=dt, device=dev)
 
-    # ── Timing helper: wall-clock per phase, CUDA-synced for accuracy ────────
-    _time_this_step = False
-    _phase_times: Dict[str, float] = {}
-    _t0 = [0.0]
-
-    def _tic():
-        if _time_this_step:
-            torch.cuda.synchronize(device)
-            _t0[0] = time.perf_counter()
-
-    def _toc(label: str):
-        if _time_this_step:
-            torch.cuda.synchronize(device)
-            dt_ = time.perf_counter() - _t0[0]
-            _phase_times[label] = _phase_times.get(label, 0.0) + dt_
-            _t0[0] = time.perf_counter()
-
     for step in range(cfg.steps):
-        # Time the first few steps on every rank (step 0 includes warmup/compile
-        # overhead, so step 1-2 are more representative of steady-state cost).
-        _time_this_step = step in (0, 1, 2)
-        _phase_times = {}
-        _tic()
 
         if optimizer is not None:
             optimizer.zero_grad()
@@ -1359,14 +1461,12 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
         idxs      = rng.integers(len(problems), size=B)
         questions = [problems[i][0] for i in idxs]
         answers   = [problems[i][1] for i in idxs]
-        _toc("data_sampling")
 
         # ── Forward: all n rounds (paper Eq.6: L_out = CE(S^n(...S^1(x)), y)) ─
         feedback_prefix = None
         rounds = []
 
         for r in range(cfg.n_rounds):
-            _tic()
             out = forward_one_round(
                 planner_mdl, planner_tok, planner_inner,
                 critic_mdl,  critic_tok,  critic_inner,
@@ -1381,10 +1481,9 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                 monitor=monitor,
                 round_idx=r,
                 shared_link=shared_link,
-                debug=(step == 0),
+                is_last_round=(r == cfg.n_rounds - 1),
             )
             rounds.append(out)
-            _toc(f"forward_round{r}")
 
             if r < cfg.n_rounds - 1:
                 if pipeline and rs != rp:
@@ -1399,14 +1498,12 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                         out["fb_recv"] = feedback_prefix
                 else:
                     feedback_prefix = out.get("feedback")
-                _toc(f"feedback_exchange_round{r}")
 
         # ── Loss: already computed inside forward_one_round (mean over batch) ─
         last = rounds[-1]
         loss = last.get("solver_loss") if rank == rs else None
 
         # ── Backward: explicit, barrier-separated pipeline grad exchange ──────
-        _tic()
         if not pipeline:
             if loss is not None:
                 loss.backward()
@@ -1465,40 +1562,23 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                         o["g_fb_for_prev"] = _recv_tensor(src=rp, device=device, dtype=dtype,
                                                           shape=(B, cfg.latent_steps, PLANNER_DIM))
 
-        _toc("backward_pipeline")
+        # ── Free forward graphs before sync/optimizer ────────────────────────
+        step_loss_scalar = loss.item() if loss is not None else float("nan")
+        del loss, rounds
 
-        # ── Debug: verify backward produced gradients on local trainable params ─
-        if step == 0 and local_params:
-            local_names = []
-            if shared_link is not None:
-                local_names = [n for n, _ in shared_link.named_parameters()]
-            else:
-                if outer_12 is not None: local_names += [f"outer_12.{n}" for n, _ in outer_12.named_parameters()]
-                if outer_23 is not None: local_names += [f"outer_23.{n}" for n, _ in outer_23.named_parameters()]
-                if outer_31 is not None: local_names += [f"outer_31.{n}" for n, _ in outer_31.named_parameters()]
-            n_with_grad = sum(1 for p in local_params if p.grad is not None)
-            grad_norm_total = sum(
-                p.grad.detach().float().norm().item() ** 2 for p in local_params if p.grad is not None
-            ) ** 0.5
-            print(f"[dbg bwd rank {rank}] theoretical: all {len(local_params)} local trainable params "
-                  f"({local_names[:1]}{'...' if len(local_names) > 1 else ''}) should have non-None .grad after backward  |  "
-                  f"practical: {n_with_grad}/{len(local_params)} have grad, total_grad_norm={grad_norm_total:.4e}")
-
-        _tic()
         # ── Sync loss scalar to rank 0 for logging ────────────────────────────
         if _is_dist():
             loss_val = torch.tensor(
-                [loss.item() if loss is not None else float("nan")],
+                [step_loss_scalar],
                 dtype=torch.float32, device=device,
             )
             dist.broadcast(loss_val, src=rs)
             step_loss = loss_val.item()
         else:
-            step_loss = loss.item() if loss is not None else float("nan")
+            step_loss = step_loss_scalar
 
         # ── Sync, clip, step ──────────────────────────────────────────────────
         _barrier()
-        _toc("loss_sync_barrier")
 
         # Flattened allreduce for SharedRecursiveLink.
         if _is_dist() and shared_link is not None:
@@ -1515,36 +1595,15 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                         offset += n
 
         if optimizer is not None:
-            if step == 0 and local_params:
-                _pre_step_snapshot = [p.detach().clone() for p in local_params]
             torch.nn.utils.clip_grad_norm_(local_params, max_norm=1.0)
             optimizer.step()
             scheduler.step()
-            if step == 0 and local_params:
-                total_delta = sum(
-                    (p.detach() - p0).float().norm().item() ** 2
-                    for p, p0 in zip(local_params, _pre_step_snapshot)
-                ) ** 0.5
-                print(f"[dbg opt rank {rank}] theoretical: optimizer.step() should change every local "
-                      f"trainable param by a non-zero amount (lr={cfg.lr})  |  "
-                      f"practical: total_param_delta_norm={total_delta:.4e}")
-        _toc("grad_sync_and_optimizer")
 
         # ── Logging ──────────────────────────────────────────────────────────
         if rank == rp and monitor is not None:
             monitor.commit_step()
         if _is_dist():
             _sync_norms_all_ranks(monitor, cfg.n_rounds)
-        _toc("logging_and_norm_sync")
-
-        if _time_this_step:
-            total = sum(_phase_times.values())
-            ranked = sorted(_phase_times.items(), key=lambda kv: kv[1], reverse=True)
-            breakdown = "  ".join(f"{name}={dt_:.3f}s ({100*dt_/total:.1f}%)" for name, dt_ in ranked)
-            bottleneck = ranked[0]
-            print(f"[dbg time rank {rank} step {step}] total={total:.3f}s  "
-                  f"BOTTLENECK={bottleneck[0]} ({bottleneck[1]:.3f}s, {100*bottleneck[1]/total:.1f}%)\n"
-                  f"    breakdown: {breakdown}")
 
         if rank == 0:
             losses.append(step_loss)
@@ -1563,23 +1622,6 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                 else:
                     print(f"  step {step:4d}  loss={step_loss:.4f}")
 
-            # Eval probe — all ranks participate (pipeline collectives inside)
-            eval_probe(
-                step=step,
-                question=probe_question,
-                answer=probe_answer,
-                planner_mdl=planner_mdl, planner_tok=planner_tok, planner_inner=planner_inner,
-                critic_mdl=critic_mdl,   critic_tok=critic_tok,   critic_inner=critic_inner,
-                solver_mdl=solver_mdl,   solver_tok=solver_tok,   solver_inner=solver_inner,
-                outer_12=outer_12, outer_23=outer_23, outer_31=outer_31,
-                shared_link=shared_link,
-                latent_steps=cfg.latent_steps,
-                n_rounds=cfg.n_rounds,
-                max_new_tokens=cfg.latent_steps,
-                device=device,
-                dtype=dtype,
-                probe_log_file=probe_log_file,
-            )
 
     # Gather results: collect norm history from rank_planner to rank 0
     if _is_dist() and rp != 0:
@@ -1601,6 +1643,19 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     else:
         grad_norms = monitor.norms if monitor is not None else {r: [] for r in range(cfg.n_rounds)}
 
+    # ── Save checkpoint (rank 0 only; after all training steps) ─────────────
+    ckpt_dir = save_checkpoint(
+        outer_12=outer_12,
+        outer_23=outer_23,
+        outer_31=outer_31,
+        shared_link=shared_link,
+        cfg=cfg,
+        mode=mode,
+        rank=rank,
+    )
+    if rank == 0 and ckpt_dir is not None:
+        print(f"\n[ckpt] Saved {mode} checkpoint → {ckpt_dir}")
+
     # ── Free this run's models/optimizer before returning ────────────────────
     # `compare` mode calls run_training twice in the same process (original,
     # then shared_roae); without releasing CUDA memory here, the second run's
@@ -1614,7 +1669,176 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     gc.collect()
     torch.cuda.empty_cache()
 
-    return {"losses": losses, "grad_norms_per_round": grad_norms}
+    return {"losses": losses, "grad_norms_per_round": grad_norms,
+            "checkpoint_dir": str(ckpt_dir) if ckpt_dir else None}
+
+
+# ── Checkpoint saving ─────────────────────────────────────────────────────────
+
+def save_checkpoint(
+    outer_12,
+    outer_23,
+    outer_31,
+    shared_link,
+    cfg,
+    mode: str,
+    rank: int,
+) -> Optional[Path]:
+    """
+    Save trained outer-link weights so they can be loaded by run.py for evaluation.
+
+    original mode
+    ─────────────
+    Writes three CrossModelAdapter .pt files plus an outerlink_config.json whose
+    format exactly matches the released Sequential-Light-Outerlinks repo.
+    resolve_outer_paths() in hf_resolver.py reads this manifest directly, so no
+    changes to the inference stack are needed.
+
+    Layout:
+        outputs/checkpoints/<out_prefix>_original_r<N>/
+            Planner-Critic-Outerlink(math).pt
+            Critic-Solver-Outerlink(math).pt
+            Solver-Planner-Outerlink(math).pt
+            outerlink_config.json
+
+    shared_roae mode
+    ────────────────
+    Saves the SharedRecursiveLink state dict + architecture config so that
+    run.py --style sequential_light_shared_roae can load it via --shared_link_path
+    (supported by inference_mas.py).
+
+    Layout:
+        outputs/checkpoints/<out_prefix>_shared_roae_r<N>/
+            shared_recursive_link.pt
+            shared_roae_config.json
+
+    Only rank 0 writes files; all ranks participate (barrier before return).
+    """
+    import json as _json
+
+    out_prefix = getattr(cfg, "out_prefix", "outerlink_grad")
+    n_rounds   = cfg.n_rounds
+    ckpt_root  = THIS_DIR / "outputs" / "checkpoints"
+
+    ckpt_dir = ckpt_root / f"{out_prefix}_{mode}_r{n_rounds}"
+
+    # In pipeline mode each outer adapter lives on a different rank.
+    # Gather all three state dicts to rank 0 via object broadcast before writing.
+    if _is_dist():
+        import pickle as _pickle
+
+        def _gather_sd_to_rank0(adapter, owner_rank: int):
+            """Send adapter state dict from owner_rank to rank 0; return on rank 0."""
+            if owner_rank == 0:
+                sd = {k: v.detach().cpu() for k, v in adapter.state_dict().items()} if adapter is not None else {}
+                return sd
+            if rank == owner_rank and adapter is not None:
+                blob = _pickle.dumps({k: v.detach().cpu() for k, v in adapter.state_dict().items()})
+                size_t = torch.tensor([len(blob)], dtype=torch.long, device=f"cuda:{rank}")
+                dist.send(size_t, dst=0)
+                data_t = torch.frombuffer(bytearray(blob), dtype=torch.uint8).to(f"cuda:{rank}")
+                dist.send(data_t, dst=0)
+            elif rank == owner_rank and adapter is None:
+                size_t = torch.tensor([0], dtype=torch.long, device=f"cuda:{rank}")
+                dist.send(size_t, dst=0)
+            if rank == 0:
+                size_t = torch.zeros(1, dtype=torch.long, device=f"cuda:{rank}")
+                dist.recv(size_t, src=owner_rank)
+                n = size_t.item()
+                if n == 0:
+                    return {}
+                data_t = torch.zeros(n, dtype=torch.uint8, device=f"cuda:{rank}")
+                dist.recv(data_t, src=owner_rank)
+                return _pickle.loads(bytes(data_t.cpu().numpy()))
+            return {}
+
+        rp = _pipeline_rank("planner")
+        rc = _pipeline_rank("critic")
+        rs = _pipeline_rank("solver")
+        sd_12 = _gather_sd_to_rank0(outer_12, rp)
+        sd_23 = _gather_sd_to_rank0(outer_23, rc)
+        sd_31 = _gather_sd_to_rank0(outer_31, rs)
+        # shared_roae: all ranks hold the same weights; rank 0 already has them.
+        sd_shared = ({k: v.detach().cpu() for k, v in shared_link.state_dict().items()}
+                     if (rank == 0 and shared_link is not None) else {})
+    else:
+        sd_12     = {k: v.detach().cpu() for k, v in outer_12.state_dict().items()} if outer_12 is not None else {}
+        sd_23     = {k: v.detach().cpu() for k, v in outer_23.state_dict().items()} if outer_23 is not None else {}
+        sd_31     = {k: v.detach().cpu() for k, v in outer_31.state_dict().items()} if outer_31 is not None else {}
+        sd_shared = {k: v.detach().cpu() for k, v in shared_link.state_dict().items()} if shared_link is not None else {}
+
+    if rank == 0:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        if mode == "original":
+
+            for fname, sd in [
+                ("Planner-Critic-Outerlink(math).pt", sd_12),
+                ("Critic-Solver-Outerlink(math).pt",  sd_23),
+                ("Solver-Planner-Outerlink(math).pt",  sd_31),
+            ]:
+                if sd:
+                    torch.save(sd, ckpt_dir / fname)
+
+            manifest = {
+                "format_version": 1,
+                "paradigm": "sequential",
+                "variant": "light",
+                "tasks": {
+                    "math": {
+                        "task": "math",
+                        "adapters": [
+                            {
+                                "legacy_key": "outer_12",
+                                "filename": "Planner-Critic-Outerlink(math).pt",
+                                "source_role": "Planner",
+                                "target_role": "Critic",
+                                "adapter_type": "outer_ln_res_adapter",
+                                "in_dim": PLANNER_DIM,
+                                "out_dim": CRITIC_DIM,
+                            },
+                            {
+                                "legacy_key": "outer_23",
+                                "filename": "Critic-Solver-Outerlink(math).pt",
+                                "source_role": "Critic",
+                                "target_role": "Solver",
+                                "adapter_type": "outer_ln_res_adapter",
+                                "in_dim": CRITIC_DIM,
+                                "out_dim": SOLVER_DIM,
+                            },
+                            {
+                                "legacy_key": "outer_31",
+                                "filename": "Solver-Planner-Outerlink(math).pt",
+                                "source_role": "Solver",
+                                "target_role": "Planner",
+                                "adapter_type": "outer_ln_res_adapter",
+                                "in_dim": SOLVER_DIM,
+                                "out_dim": PLANNER_DIM,
+                            },
+                        ],
+                    }
+                },
+            }
+            with open(ckpt_dir / "outerlink_config.json", "w") as f:
+                _json.dump(manifest, f, indent=2)
+
+        elif mode == "shared_roae":
+            if sd_shared:
+                torch.save(sd_shared, ckpt_dir / "shared_recursive_link.pt")
+                # Store architecture hyperparams alongside the weights so run.py
+                # can reconstruct the module without passing CLI flags.
+                config = {
+                    "hidden_dims": shared_link.hidden_dims if shared_link is not None else [PLANNER_DIM, CRITIC_DIM, SOLVER_DIM],
+                    "shared_dim":  shared_link.shared_dim  if shared_link is not None else 512,
+                    "n_experts":   shared_link.n_experts   if shared_link is not None else getattr(cfg, "n_experts", 4),
+                    "expert_dim_divisor": getattr(cfg, "expert_dim_divisor", 4),
+                    "adapter_type": "shared_recursive_link",
+                }
+                with open(ckpt_dir / "shared_roae_config.json", "w") as f:
+                    _json.dump(config, f, indent=2)
+
+    _barrier()
+    return ckpt_dir if rank == 0 else None
 
 
 # ── Analysis + plotting (rank 0 only) ────────────────────────────────────────
@@ -1763,8 +1987,9 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4,
                    help="Problems per optimizer update (training batch size).")
     p.add_argument("--dataset", type=str, default="math500",
-                   help="Training dataset: 'math500', 's1k', 'm1k', or a '+'-joined "
-                        "combination such as 's1k+m1k' (pools and shuffles samples).")
+                   help="Training dataset: 'math500', 's1k', 'm1k', 'opencodereasoning', "
+                        "'arpo_sft', or a '+'-joined combination such as "
+                        "'s1k+m1k+opencodereasoning+arpo_sft' (pools and shuffles samples).")
     p.add_argument("--max_seq_len", type=int, default=0,
                    help="Max combined (question+answer) sequence length in tokens "
                         "(approximate, char-based truncation). 0 = no truncation.")

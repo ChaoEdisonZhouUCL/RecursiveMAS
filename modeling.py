@@ -1,6 +1,8 @@
+import json
+import math
 import os
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -157,4 +159,147 @@ class CrossModelAdapter(nn.Module):
         out = self.proj2(self.act(self.proj1(h)))
         out = out + self.residual_proj(x)
         return self.ln_target(out)
+
+
+# ── SharedRecursiveLink (shared_roae mode) ────────────────────────────────────
+
+def _build_rope_cache(max_idx: int, dim: int, device: torch.device):
+    half = dim // 2
+    k = torch.arange(half, dtype=torch.float32, device=device)
+    theta = 1.0 / (10000.0 ** (2 * k / dim))
+    idx = torch.arange(max_idx + 1, dtype=torch.float32, device=device)
+    angles = torch.outer(idx, theta)
+    return angles.cos(), angles.sin()
+
+
+def _rope_rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
+class SharedRecursiveLink(nn.Module):
+    """
+    Single shared cross-model adapter for all pipeline transitions.
+
+    Architecture:
+      - Per-agent in/out linear projections to/from a shared latent space.
+      - RoAE: rotary position encoding per agent index so the shared MoE core
+        can distinguish "planner→critic" from "solver→planner", etc.
+      - Soft-MoE with n_experts experts dispatched by an RoAE-conditioned router.
+      - ReZero gate (alpha): starts as a pure skip connection.
+      - Direct skip_proj in native hidden spaces for a gradient highway.
+
+    Agents are 1-indexed: 1=Planner, 2=Critic, 3=Solver.
+    """
+
+    N_AGENTS = 3
+
+    def __init__(self, hidden_dims: List[int], shared_dim: int,
+                 n_experts: int = 4, expert_dim_divisor: int = 4):
+        super().__init__()
+        self.hidden_dims = hidden_dims
+        self.shared_dim  = shared_dim
+        self.n_experts   = n_experts
+        N = len(hidden_dims)
+        d = shared_dim
+
+        self.in_proj = nn.ModuleList(
+            [nn.Identity()] + [nn.Linear(h, d) for h in hidden_dims]
+        )
+        self.out_proj = nn.ModuleList(
+            [nn.Identity()] + [nn.Linear(d, h) for h in hidden_dims]
+        )
+        self.skip_proj = nn.ModuleList([
+            nn.ModuleList([
+                nn.Linear(hidden_dims[i], hidden_dims[j], bias=False)
+                for j in range(N)
+            ])
+            for i in range(N)
+        ])
+        for i in range(N):
+            for j in range(N):
+                nn.init.orthogonal_(self.skip_proj[i][j].weight)
+
+        self.router    = nn.Linear(3 * d, n_experts, bias=False)
+        exp_hidden = max(1, d // expert_dim_divisor)
+        self.expert_W1 = nn.Parameter(torch.empty(n_experts, d, exp_hidden))
+        self.expert_b1 = nn.Parameter(torch.zeros(n_experts, exp_hidden))
+        self.expert_W2 = nn.Parameter(torch.zeros(n_experts, exp_hidden, d))
+        self.expert_b2 = nn.Parameter(torch.zeros(n_experts, d))
+        nn.init.kaiming_uniform_(self.expert_W1, a=math.sqrt(5))
+
+        self.act   = nn.GELU()
+        self.ln_in = nn.LayerNorm(d)
+        self.alpha = nn.Parameter(torch.tensor(1e-3))
+
+        self._rope_cache: dict = {}
+
+    def _get_rope(self, device, dtype):
+        key = (device, dtype)
+        if key not in self._rope_cache:
+            cos, sin = _build_rope_cache(self.N_AGENTS, self.shared_dim, device)
+            self._rope_cache[key] = (cos.to(dtype), sin.to(dtype))
+        return self._rope_cache[key]
+
+    def forward(self, h: torch.Tensor, src: int, dst: int) -> torch.Tensor:
+        """h: (B, T, hidden_dims[src-1]);  src/dst are 1-indexed agent indices."""
+        src0, dst0 = src - 1, dst - 1
+        skip = self.skip_proj[src0][dst0](h)
+
+        x = self.in_proj[src](h)
+        cos_tab, sin_tab = self._get_rope(x.device, x.dtype)
+        x_src = _rope_rotate(x, cos_tab[src], sin_tab[src])
+        x_dst = _rope_rotate(x, cos_tab[dst], sin_tab[dst])
+
+        gate_input = torch.cat([x_src, x_dst, x_dst - x_src], dim=-1)
+        logits = self.router(gate_input.mean(dim=1))
+        w = torch.softmax(logits / 2.0, dim=-1).unsqueeze(1)
+
+        normed = self.ln_in(x_src)
+        W1 = self.expert_W1.to(normed.dtype)
+        b1 = self.expert_b1.to(normed.dtype)
+        W2 = self.expert_W2.to(normed.dtype)
+        b2 = self.expert_b2.to(normed.dtype)
+        h1 = self.act(torch.einsum("btd,kde->btke", normed, W1) + b1)
+        h2 = (torch.einsum("btke,ked->btd", h1 * w.unsqueeze(-1), W2)
+              + (w @ b2).squeeze(1).unsqueeze(1))
+        return skip + self.alpha * self.out_proj[dst](h2)
+
+
+def load_shared_recursive_link(
+    ckpt_dir: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> "SharedRecursiveLink":
+    """
+    Load a SharedRecursiveLink from a checkpoint directory produced by
+    train_outerlinks_math500.py (shared_roae mode).
+
+    The directory must contain:
+        shared_recursive_link.pt   — state dict
+        shared_roae_config.json    — architecture hyperparams
+    """
+    config_path = Path(ckpt_dir) / "shared_roae_config.json"
+    weights_path = Path(ckpt_dir) / "shared_recursive_link.pt"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"shared_roae_config.json not found in {ckpt_dir}")
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"shared_recursive_link.pt not found in {ckpt_dir}")
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    module = SharedRecursiveLink(
+        hidden_dims=cfg["hidden_dims"],
+        shared_dim=cfg["shared_dim"],
+        n_experts=cfg["n_experts"],
+        expert_dim_divisor=cfg.get("expert_dim_divisor", 4),
+    )
+    sd = torch.load(str(weights_path), map_location="cpu")
+    module.load_state_dict(sd, strict=True)
+    module.to(device=device, dtype=dtype).eval()
+    for p in module.parameters():
+        p.requires_grad_(False)
+    return module
 

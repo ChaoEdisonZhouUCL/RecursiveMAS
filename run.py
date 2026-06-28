@@ -58,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top_k", type=int, default=-1)
     p.add_argument("--trust_remote_code", type=int, default=1, choices=[0, 1])
     p.add_argument("--device", default=None)
+    p.add_argument(
+        "--ckpt_dir", type=str, default=None,
+        help="Path to a locally trained outer-link checkpoint directory "
+             "(outputs/checkpoints/<prefix>_<mode>_r<N>/).  Required for "
+             "--style sequential_light_trained and sequential_light_shared_roae.",
+    )
     return p
 
 
@@ -120,7 +126,7 @@ def apply_recommended_settings(args: argparse.Namespace) -> None:
         )
 
 
-def resolve_style_paths(style: str, dataset: str) -> Dict[str, Path]:
+def resolve_style_paths(style: str, dataset: str, ckpt_dir: str = None) -> Dict[str, Path]:
     spec = STYLE_SPECS[style]
     repos = spec["repos"]
     task = task_for_inner_repo(dataset)
@@ -140,6 +146,49 @@ def resolve_style_paths(style: str, dataset: str) -> Dict[str, Path]:
         out["outer_12"] = outer_paths["outer_12"]
         out["outer_23"] = outer_paths["outer_23"]
         out["outer_31"] = outer_paths["outer_31"]
+        return out
+
+    if family == "sequential_local":
+        # Backbone models from HF cache; outer adapters from local checkpoint dir.
+        if not ckpt_dir:
+            raise ValueError(
+                "--ckpt_dir is required for --style sequential_light_trained. "
+                "Point it to outputs/checkpoints/<prefix>_original_r<N>/"
+            )
+        ckpt_path = Path(ckpt_dir)
+        if not ckpt_path.is_dir():
+            raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_path}")
+        for key in ["planner", "critic", "solver"]:
+            out[key] = materialize(key)
+        out["planner_adapter"] = resolve_inner_adapter(out["planner"], task)
+        out["critic_adapter"]  = resolve_inner_adapter(out["critic"],  task)
+        out["solver_adapter"]  = resolve_inner_adapter(out["solver"],  task)
+        outer_paths = resolve_outer_paths(ckpt_path, task=task)
+        out["outer_12"] = outer_paths["outer_12"]
+        out["outer_23"] = outer_paths["outer_23"]
+        out["outer_31"] = outer_paths["outer_31"]
+        return out
+
+    if family == "sequential_shared_roae":
+        # Backbone models from HF cache; shared link from local checkpoint dir.
+        if not ckpt_dir:
+            raise ValueError(
+                "--ckpt_dir is required for --style sequential_light_shared_roae. "
+                "Point it to outputs/checkpoints/<prefix>_shared_roae_r<N>/"
+            )
+        ckpt_path = Path(ckpt_dir)
+        if not ckpt_path.is_dir():
+            raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_path}")
+        for key in ["planner", "critic", "solver"]:
+            out[key] = materialize(key)
+        out["planner_adapter"]   = resolve_inner_adapter(out["planner"], task)
+        out["critic_adapter"]    = resolve_inner_adapter(out["critic"],  task)
+        out["solver_adapter"]    = resolve_inner_adapter(out["solver"],  task)
+        out["shared_link_path"]  = ckpt_path          # passed to inference_mas via CLI
+        # Sentinel outer paths — not used (shared_link replaces them)
+        out["outer_12"] = ckpt_path / "shared_recursive_link.pt"
+        out["outer_23"] = ckpt_path / "shared_recursive_link.pt"
+        out["outer_31"] = ckpt_path / "shared_recursive_link.pt"
         return out
 
     if family == "mixture":
@@ -245,7 +294,7 @@ def build_cli_for_style(
 ) -> Tuple[object, List[str]]:
     common = build_common_cli(args, dataset_arg=dataset_arg, dataset_split=dataset_split, latent_steps=latent_steps, max_new_tokens=max_new_tokens)
 
-    if family == "sequential":
+    if family in ("sequential", "sequential_local", "sequential_shared_roae"):
         choice_old_prompt = GPQA_DEFAULT_CHOICE_OLD_PROMPT if args.dataset.lower() == "gpqa" else 0
         cli = [
             "--mas_shape", "chain",
@@ -263,6 +312,8 @@ def build_cli_for_style(
             "--inner_adapter_type_fallback", "ln_res_adapter",
             "--outer_adapter_type_fallback", "outer_ln_res_adapter",
         ] + common
+        if family == "sequential_shared_roae" and "shared_link_path" in paths:
+            cli += ["--shared_link_path", str(paths["shared_link_path"])]
         return inference_mas, cli
 
     if family == "mixture":
@@ -332,7 +383,7 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent
     dataset_arg = resolve_medqa_dataset_arg(args.dataset, repo_root)
     dataset_split = infer_dataset_split(args.dataset, args.dataset_split)
-    paths = resolve_style_paths(args.style, args.dataset)
+    paths = resolve_style_paths(args.style, args.dataset, ckpt_dir=args.ckpt_dir)
     family = str(STYLE_SPECS[args.style]["family"])
     latent_steps_values = resolve_latent_steps(args.latent_length)
 

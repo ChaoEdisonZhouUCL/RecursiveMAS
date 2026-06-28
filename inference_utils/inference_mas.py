@@ -77,8 +77,10 @@ from .lcb_utils import (
 from modeling import (
     Adapter,
     CrossModelAdapter,
+    SharedRecursiveLink,
     infer_inner_adapter_type_from_state_dict,
     infer_outer_adapter_type_from_state_dict,
+    load_shared_recursive_link,
     normalize_inner_adapter_type,
     normalize_outer_adapter_type,
     resolve_local_pretrained_path,
@@ -94,6 +96,15 @@ RELEASE_RECOMMENDED_SETTINGS: Dict[Tuple[str, str], Dict[str, int]] = {
     ("sequential_light", "medqa"): {"seed": 42, "batch_size": 16, "latent_length": 32},
     ("sequential_light", "gpqa"): {"seed": 42, "batch_size": 16, "latent_length": 32},
     ("sequential_light", "mbppplus"): {"seed": 42, "batch_size": 16, "latent_length": 16},
+    # trained variants use the same latent_length as their base style
+    ("sequential_light_trained", "math500"): {"seed": 42, "batch_size": 32, "latent_length": 48},
+    ("sequential_light_trained", "medqa"): {"seed": 42, "batch_size": 16, "latent_length": 32},
+    ("sequential_light_trained", "gpqa"): {"seed": 42, "batch_size": 16, "latent_length": 32},
+    ("sequential_light_trained", "mbppplus"): {"seed": 42, "batch_size": 16, "latent_length": 16},
+    ("sequential_light_shared_roae", "math500"): {"seed": 42, "batch_size": 32, "latent_length": 48},
+    ("sequential_light_shared_roae", "medqa"): {"seed": 42, "batch_size": 16, "latent_length": 32},
+    ("sequential_light_shared_roae", "gpqa"): {"seed": 42, "batch_size": 16, "latent_length": 32},
+    ("sequential_light_shared_roae", "mbppplus"): {"seed": 42, "batch_size": 16, "latent_length": 16},
     ("sequential_scaled", "math500"): {"seed": 42, "batch_size": 16, "latent_length": 32},
     ("sequential_scaled", "medqa"): {"seed": 42, "batch_size": 16, "latent_length": 48},
     ("sequential_scaled", "gpqa"): {"seed": 42, "batch_size": 16, "latent_length": 48},
@@ -963,9 +974,11 @@ def run_planner_latent_stage(
     enable_thinking: bool,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    shared_link: Optional["SharedRecursiveLink"] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
-        out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
+        out_dim = (shared_link.hidden_dims[1] if shared_link is not None
+                   else infer_outer_adapter_out_dim_from_file(outer_12_path))
         return [torch.empty((0, out_dim), dtype=torch.float32) for _ in questions]
 
     model, tokenizer = load_agent_model_and_tokenizer(
@@ -987,15 +1000,18 @@ def run_planner_latent_stage(
         fallback_adapter_type=inner_adapter_type_fallback,
     )
 
-    probe_out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
-    outer_12 = load_outer_adapter_module(
-        adapter_path=outer_12_path,
-        in_dim=planner_hidden,
-        out_dim=probe_out_dim,
-        adapter_type=outer_12_type,
-        device=device,
-        dtype=outer_dtype,
-    )
+    if shared_link is None:
+        probe_out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
+        outer_12 = load_outer_adapter_module(
+            adapter_path=outer_12_path,
+            in_dim=planner_hidden,
+            out_dim=probe_out_dim,
+            adapter_type=outer_12_type,
+            device=device,
+            dtype=outer_dtype,
+        )
+    else:
+        outer_12 = None
 
     prompt_ids = []
     for idx, question in enumerate(questions):
@@ -1029,7 +1045,11 @@ def run_planner_latent_stage(
             latent_steps=latent_steps,
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
-        lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
+        if shared_link is not None:
+            lat12 = shared_link(planner_self.to(device=shared_link.in_proj[1].weight.device),
+                                src=1, dst=2).to(planner_embed_dtype)
+        else:
+            lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
 
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
@@ -1055,9 +1075,11 @@ def run_refiner_latent_stage(
     enable_thinking: bool,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    shared_link: Optional["SharedRecursiveLink"] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
-        out_dim = infer_outer_adapter_out_dim_from_file(outer_23_path)
+        out_dim = (shared_link.hidden_dims[2] if shared_link is not None
+                   else infer_outer_adapter_out_dim_from_file(outer_23_path))
         return [torch.empty((0, out_dim), dtype=torch.float32) for _ in questions]
 
     model, tokenizer = load_agent_model_and_tokenizer(
@@ -1085,15 +1107,18 @@ def run_refiner_latent_stage(
         fallback_adapter_type=inner_adapter_type_fallback,
     )
 
-    probe_out_dim = infer_outer_adapter_out_dim_from_file(outer_23_path)
-    outer_23 = load_outer_adapter_module(
-        adapter_path=outer_23_path,
-        in_dim=refiner_hidden,
-        out_dim=probe_out_dim,
-        adapter_type=outer_23_type,
-        device=device,
-        dtype=outer_dtype,
-    )
+    if shared_link is None:
+        probe_out_dim = infer_outer_adapter_out_dim_from_file(outer_23_path)
+        outer_23 = load_outer_adapter_module(
+            adapter_path=outer_23_path,
+            in_dim=refiner_hidden,
+            out_dim=probe_out_dim,
+            adapter_type=outer_23_type,
+            device=device,
+            dtype=outer_dtype,
+        )
+    else:
+        outer_23 = None
 
     prompt_segments = []
     for idx, question in enumerate(questions):
@@ -1150,7 +1175,11 @@ def run_refiner_latent_stage(
             latent_steps=latent_steps,
         )
         refiner_self = run_inner_adapter(inner_2, hidden_rollout, output_dtype=refiner_embed_dtype)
-        mapped = run_outer_adapter(outer_23, refiner_self, output_dtype=refiner_embed_dtype)
+        if shared_link is not None:
+            mapped = shared_link(refiner_self.to(device=shared_link.in_proj[1].weight.device),
+                                 src=2, dst=3).to(refiner_embed_dtype)
+        else:
+            mapped = run_outer_adapter(outer_23, refiner_self, output_dtype=refiner_embed_dtype)
         for i in range(mapped.size(0)):
             refiner_to_solver.append(mapped[i].detach().cpu())
 
@@ -1176,9 +1205,11 @@ def run_solver_feedback_latent_stage(
     args: argparse.Namespace,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    shared_link: Optional["SharedRecursiveLink"] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
-        out_dim = infer_outer_adapter_out_dim_from_file(outer_31_path)
+        out_dim = (shared_link.hidden_dims[0] if shared_link is not None
+                   else infer_outer_adapter_out_dim_from_file(outer_31_path))
         return [torch.empty((0, out_dim), dtype=torch.float32) for _ in questions]
 
     model, tokenizer = load_agent_model_and_tokenizer(
@@ -1206,15 +1237,18 @@ def run_solver_feedback_latent_stage(
         fallback_adapter_type=inner_adapter_type_fallback,
     )
 
-    probe_out_dim = infer_outer_adapter_out_dim_from_file(outer_31_path)
-    outer_31 = load_outer_adapter_module(
-        adapter_path=outer_31_path,
-        in_dim=solver_hidden,
-        out_dim=probe_out_dim,
-        adapter_type=outer_31_type,
-        device=device,
-        dtype=outer_dtype,
-    )
+    if shared_link is None:
+        probe_out_dim = infer_outer_adapter_out_dim_from_file(outer_31_path)
+        outer_31 = load_outer_adapter_module(
+            adapter_path=outer_31_path,
+            in_dim=solver_hidden,
+            out_dim=probe_out_dim,
+            adapter_type=outer_31_type,
+            device=device,
+            dtype=outer_dtype,
+        )
+    else:
+        outer_31 = None
 
     prompt_segments = []
     for idx, question in enumerate(questions):
@@ -1273,7 +1307,11 @@ def run_solver_feedback_latent_stage(
             latent_steps=latent_steps,
         )
         solver_self = run_inner_adapter(inner_3, hidden_rollout, output_dtype=solver_embed_dtype)
-        mapped_feedback = run_outer_adapter(outer_31, solver_self, output_dtype=torch.float32)
+        if shared_link is not None:
+            mapped_feedback = shared_link(solver_self.to(device=shared_link.in_proj[1].weight.device),
+                                          src=3, dst=1).to(torch.float32)
+        else:
+            mapped_feedback = run_outer_adapter(outer_31, solver_self, output_dtype=torch.float32)
         for i in range(mapped_feedback.size(0)):
             feedback_latents.append(mapped_feedback[i].detach().cpu())
 
@@ -1298,9 +1336,11 @@ def run_planner_feedback_latent_stage(
     enable_thinking: bool,
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
+    shared_link: Optional["SharedRecursiveLink"] = None,
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
-        out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
+        out_dim = (shared_link.hidden_dims[1] if shared_link is not None
+                   else infer_outer_adapter_out_dim_from_file(outer_12_path))
         return [torch.empty((0, out_dim), dtype=torch.float32) for _ in questions]
 
     model, tokenizer = load_agent_model_and_tokenizer(
@@ -1328,15 +1368,18 @@ def run_planner_feedback_latent_stage(
         fallback_adapter_type=inner_adapter_type_fallback,
     )
 
-    probe_out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
-    outer_12 = load_outer_adapter_module(
-        adapter_path=outer_12_path,
-        in_dim=planner_hidden,
-        out_dim=probe_out_dim,
-        adapter_type=outer_12_type,
-        device=device,
-        dtype=outer_dtype,
-    )
+    if shared_link is None:
+        probe_out_dim = infer_outer_adapter_out_dim_from_file(outer_12_path)
+        outer_12 = load_outer_adapter_module(
+            adapter_path=outer_12_path,
+            in_dim=planner_hidden,
+            out_dim=probe_out_dim,
+            adapter_type=outer_12_type,
+            device=device,
+            dtype=outer_dtype,
+        )
+    else:
+        outer_12 = None
 
     prompt_segments = []
     for idx, question in enumerate(questions):
@@ -1393,7 +1436,11 @@ def run_planner_feedback_latent_stage(
             latent_steps=latent_steps,
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
-        lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
+        if shared_link is not None:
+            lat12 = shared_link(planner_self.to(device=shared_link.in_proj[1].weight.device),
+                                src=1, dst=2).to(planner_embed_dtype)
+        else:
+            lat12 = run_outer_adapter(outer_12, planner_self, output_dtype=planner_embed_dtype)
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
 
@@ -1684,6 +1731,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outer_23_path", type=str, default=None)
     parser.add_argument("--outer_31_path", type=str, default=None)
     parser.add_argument(
+        "--shared_link_path", type=str, default=None,
+        help="Path to a SharedRecursiveLink checkpoint directory "
+             "(outputs/checkpoints/<prefix>_shared_roae_r<N>/). "
+             "When provided, replaces outer_12/23/31 with a single "
+             "SharedRecursiveLink for all cross-agent transitions.",
+    )
+    parser.add_argument(
         "--inner_adapter_type_fallback",
         type=str,
         default="ln_res_adapter",
@@ -1877,11 +1931,24 @@ def main() -> None:
     outer_12_type = args.outer_adapter_type_fallback
     outer_23_type = args.outer_adapter_type_fallback
     outer_31_type = args.outer_adapter_type_fallback
-    outer_12_path, outer_23_path, outer_31_path = resolve_recursive_outer_paths(
-        outer_12_path=args.outer_12_path,
-        outer_23_path=args.outer_23_path,
-        outer_31_path=args.outer_31_path,
-    )
+
+    shared_link: Optional[SharedRecursiveLink] = None
+    if getattr(args, "shared_link_path", None):
+        from pathlib import Path as _Path
+        shared_link = load_shared_recursive_link(
+            ckpt_dir=_Path(args.shared_link_path),
+            device=device,
+            dtype=outer_dtype if not isinstance(outer_dtype, str) else torch.bfloat16,
+        )
+        print(f"[shared_roae] Loaded SharedRecursiveLink from {args.shared_link_path}")
+        # Sentinel paths — not used when shared_link is active but must satisfy resolver.
+        outer_12_path = outer_23_path = outer_31_path = "__shared_link__"
+    else:
+        outer_12_path, outer_23_path, outer_31_path = resolve_recursive_outer_paths(
+            outer_12_path=args.outer_12_path,
+            outer_23_path=args.outer_23_path,
+            outer_31_path=args.outer_31_path,
+        )
 
     dataset_name, questions, gold_answers, sample_metadata = load_eval_questions_and_answers(
         dataset=args.dataset,
@@ -2294,6 +2361,7 @@ def main() -> None:
             enable_thinking=enable_thinking,
             task_types=task_types,
             fn_names=fn_names,
+            shared_link=shared_link,
         )
         refiner_to_solver = run_refiner_latent_stage(
             model_name_or_path=refiner_model,
@@ -2312,6 +2380,7 @@ def main() -> None:
             enable_thinking=enable_thinking,
             task_types=task_types,
             fn_names=fn_names,
+            shared_link=shared_link,
         )
         solver_outputs = run_solver_latent_stage(
             model_name_or_path=solver_model,
@@ -2401,6 +2470,7 @@ def main() -> None:
                     enable_thinking=enable_thinking,
                     task_types=task_types,
                     fn_names=fn_names,
+                    shared_link=shared_link,
                 )
             else:
                 if feedback_to_planner is None:
@@ -2420,6 +2490,7 @@ def main() -> None:
                     trust_remote_code=trust_remote_code,
                     inner_adapter_type_fallback=args.inner_adapter_type_fallback,
                     enable_thinking=enable_thinking,
+                    shared_link=shared_link,
                 )
             planner_to_refiner = [x for x in planner_to_refiner]
             planner_to_refiner_rounds.append(planner_to_refiner)
@@ -2441,6 +2512,7 @@ def main() -> None:
                 enable_thinking=enable_thinking,
                 task_types=task_types,
                 fn_names=fn_names,
+                shared_link=shared_link,
             )
             refiner_to_solver = [x for x in refiner_to_solver]
             refiner_to_solver_rounds.append(refiner_to_solver)
@@ -2464,6 +2536,7 @@ def main() -> None:
                     args=args,
                     task_types=task_types,
                     fn_names=fn_names,
+                    shared_link=shared_link,
                 )
                 feedback_to_planner = [x for x in feedback_to_planner]
                 feedback_to_planner_rounds.append(feedback_to_planner)

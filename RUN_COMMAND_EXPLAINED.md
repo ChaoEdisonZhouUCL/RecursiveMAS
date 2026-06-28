@@ -158,6 +158,85 @@ run.py
 | [run.py](run.py) | Entry point, CLI wrapper, accuracy capture |
 | [load_from_repo.py](load_from_repo.py) | Style specs, dataset defaults |
 | [inference_utils/inference_mas.py](inference_utils/inference_mas.py) | Core 3-agent recursive inference |
-| [modeling.py](modeling.py) | Inner/outer adapter implementations |
+| [modeling.py](modeling.py) | Inner/outer adapter + `SharedRecursiveLink` implementations |
 | [prompts.py](prompts.py) | Prompt templates with `PLANNER_SLOT`, `REFINED_SLOT`, `FEEDBACK_SLOT` |
 | [inference_utils/answer_utils.py](inference_utils/answer_utils.py) | Answer extraction and comparison |
+
+---
+
+## 7. Evaluating Locally Trained Checkpoints
+
+`train_outerlinks_math500.py` saves checkpoints at the end of training into
+`outputs/checkpoints/<out_prefix>_<mode>_r<N>/`.  Two new `--style` values
+let `run.py` evaluate these trained adapters against the released backbone
+models.
+
+### 7a. Original mode (three independent CrossModelAdapters)
+
+After running training with `--mode original` (or `compare`), a checkpoint directory like
+`outputs/checkpoints/outerlink_grad_original_r5/` is created.  Pass it via `--ckpt_dir`:
+
+```bash
+python run.py \
+  --style sequential_light_trained \
+  --ckpt_dir outputs/checkpoints/outerlink_grad_original_r5 \
+  --batch_size 32 --temperature 0.6 --top_p 0.95 \
+  --dataset math500 --seed 42 --trust_remote_code 1 --device cuda
+```
+
+What changes vs the baseline `--style sequential_light` run:
+- Backbone models (Planner, Critic, Solver) and their inner adapters are still
+  loaded from the shared HF cache — unchanged.
+- The three outer-link `.pt` files are loaded from `--ckpt_dir` instead of
+  `RecursiveMAS/Sequential-Light-Outerlinks` on HuggingFace.
+
+### 7b. SharedRecursiveLink mode (shared MoE + RoAE)
+
+After running training with `--mode shared_roae` (or `compare`), a checkpoint directory like
+`outputs/checkpoints/outerlink_grad_shared_roae_r5/` is created:
+
+```bash
+python run.py \
+  --style sequential_light_shared_roae \
+  --ckpt_dir outputs/checkpoints/outerlink_grad_shared_roae_r5 \
+  --batch_size 32 --temperature 0.6 --top_p 0.95 \
+  --dataset math500 --seed 42 --trust_remote_code 1 --device cuda
+```
+
+What changes vs `sequential_light_trained`:
+- Instead of three separate `CrossModelAdapter` files, a single
+  `SharedRecursiveLink` (soft-MoE + Rotary Agent Encoding) is loaded from
+  `shared_recursive_link.pt` + `shared_roae_config.json` in `--ckpt_dir`.
+- `inference_mas.py` receives `--shared_link_path` and routes all cross-agent
+  latent transfers through the shared module (calls `forward(h, src=N, dst=M)`
+  with 1-indexed agent indices 1=Planner, 2=Critic, 3=Solver).
+- The `--outer_12/23/31_path` flags are set to sentinel values and ignored
+  whenever `--shared_link_path` is active.
+
+### 7c. Side-by-side comparison
+
+Run both commands sequentially (or in two separate SLURM jobs) to compare
+accuracy on the same dataset.  The `compare` training mode in
+`train_outerlinks_math500.py` produces **both** checkpoint directories in a
+single training run, so you can evaluate both without retraining:
+
+```bash
+CKPT_PREFIX=outputs/checkpoints/outerlink_grad
+
+# Baseline (released weights)
+python run.py --style sequential_light \
+  --batch_size 32 --temperature 0.6 --top_p 0.95 \
+  --dataset math500 --seed 42 --trust_remote_code 1 --device cuda
+
+# Trained original adapters
+python run.py --style sequential_light_trained \
+  --ckpt_dir ${CKPT_PREFIX}_original_r5 \
+  --batch_size 32 --temperature 0.6 --top_p 0.95 \
+  --dataset math500 --seed 42 --trust_remote_code 1 --device cuda
+
+# Trained shared_roae adapters
+python run.py --style sequential_light_shared_roae \
+  --ckpt_dir ${CKPT_PREFIX}_shared_roae_r5 \
+  --batch_size 32 --temperature 0.6 --top_p 0.95 \
+  --dataset math500 --seed 42 --trust_remote_code 1 --device cuda
+```

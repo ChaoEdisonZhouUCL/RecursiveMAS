@@ -32,6 +32,16 @@ show_help() {
     cat <<'EOF'
 Usage: ./submit.sh [OPTIONS]
 
+Eval options (--eval enables eval mode; all training flags are ignored):
+  --eval                  Run evaluation instead of training
+  --ckpt_path PATH        Checkpoint to evaluate (required with --eval):
+                            "released_weights"  → baseline (no trained adapters)
+                            path with _original    → sequential_light_trained style
+                            path with _shared_roae → sequential_light_shared_roae style
+  --eval_dataset NAME     Dataset for eval: math500 | medqa | gpqa | mbppplus  (default: math500)
+  --eval_batch_size N     Batch size for eval                                   (default: 32)
+  --eval_seed N           Random seed for eval                                  (default: 42)
+
 Training options:
   --n_rounds N            Number of recursion rounds              (default: 3)
   --latent_steps N        Latent rollout steps per agent          (default: 8)
@@ -54,6 +64,15 @@ Infrastructure:
   --slurm_time HH:MM:SS Override time limit
 
 Examples:
+  # Eval: released weights baseline
+  ./submit.sh --eval --ckpt_path released_weights
+
+  # Eval: trained original adapters
+  ./submit.sh --eval --ckpt_path /path/to/ckpt_original_r5
+
+  # Eval: trained shared_roae adapters
+  ./submit.sh --eval --ckpt_path /path/to/ckpt_shared_roae_r5
+
   # Local single-GPU, original mode
   ./submit.sh --gpus 1 --n_rounds 3 --steps 50
 
@@ -72,6 +91,11 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --eval)               EVAL=true;               shift ;;
+        --ckpt_path)          CKPT_PATH="$2";          shift 2 ;;
+        --eval_dataset)       EVAL_DATASET="$2";       shift 2 ;;
+        --eval_batch_size)    EVAL_BATCH_SIZE="$2";    shift 2 ;;
+        --eval_seed)          EVAL_SEED="$2";          shift 2 ;;
         --n_rounds)           N_ROUNDS="$2";           shift 2 ;;
         --latent_steps)       LATENT_STEPS="$2";       shift 2 ;;
         --batch_size)         BATCH_SIZE="$2";         shift 2 ;;
@@ -98,6 +122,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Normalize booleans to lowercase so comparisons work regardless of how
+# config.sh or the user set them (true/True/TRUE all accepted).
+EVAL="${EVAL,,}"
+NO_KV_CACHE="${NO_KV_CACHE,,}"
+
 # =============================================================================
 # Setup
 # =============================================================================
@@ -105,12 +134,45 @@ done
 PLATFORM=$(detect_platform)
 PROJ_DIR="$(dirname "${SCRIPT_DIR}")"
 TRAIN_SCRIPT="${PROJ_DIR}/train_outerlinks_math500.py"
+EVAL_SCRIPT="${PROJ_DIR}/run.py"
 SLURM_JOB_DIR="${PROJ_DIR}/outputs/slurm_jobs"
 SLURM_LOG_DIR="${PROJ_DIR}/outputs/slurm_logs"
 mkdir -p "${SLURM_JOB_DIR}" "${SLURM_LOG_DIR}"
 
-# Build the train command (relative to PROJ_DIR; torchrun prepends the path)
-TRAIN_CMD="${TRAIN_SCRIPT} \
+IS_HPC=false
+[[ "${PLATFORM}" == "cispa" || "${PLATFORM}" == "julich" || "${PLATFORM}" == "jureca" ]] && IS_HPC=true
+
+# =============================================================================
+# Build command
+# =============================================================================
+
+if [[ "${EVAL}" == "true" ]]; then
+    # ── Eval mode ────────────────────────────────────────────────────────────
+    if [[ -z "${CKPT_PATH}" ]]; then
+        echo "Error: --ckpt_path is required with --eval" >&2
+        exit 1
+    fi
+
+    _EVAL_COMMON="--batch_size ${EVAL_BATCH_SIZE} --temperature 0.6 --top_p 0.95 \
+    --dataset ${EVAL_DATASET} --seed ${EVAL_SEED} --trust_remote_code 1 --device cuda"
+
+    if [[ "${CKPT_PATH}" == "released_weights" ]]; then
+        EVAL_STYLE="sequential_light"
+        TRAIN_CMD="${EVAL_SCRIPT} --style ${EVAL_STYLE} ${_EVAL_COMMON}"
+    elif [[ "${CKPT_PATH}" == *"_original"* ]]; then
+        EVAL_STYLE="sequential_light_trained"
+        TRAIN_CMD="${EVAL_SCRIPT} --style ${EVAL_STYLE} --ckpt_dir ${CKPT_PATH} ${_EVAL_COMMON}"
+    elif [[ "${CKPT_PATH}" == *"_shared_roae"* ]]; then
+        EVAL_STYLE="sequential_light_shared_roae"
+        TRAIN_CMD="${EVAL_SCRIPT} --style ${EVAL_STYLE} --ckpt_dir ${CKPT_PATH} ${_EVAL_COMMON}"
+    else
+        echo "Error: cannot infer eval style from --ckpt_path '${CKPT_PATH}'." >&2
+        echo "  Path must be 'released_weights', or contain '_original' or '_shared_roae'." >&2
+        exit 1
+    fi
+else
+    # ── Training mode ─────────────────────────────────────────────────────────
+    TRAIN_CMD="${TRAIN_SCRIPT} \
     --n_rounds ${N_ROUNDS} \
     --latent_steps ${LATENT_STEPS} \
     --batch_size ${BATCH_SIZE} \
@@ -122,35 +184,48 @@ TRAIN_CMD="${TRAIN_SCRIPT} \
     --expert_dim_divisor ${EXPERT_DIM_DIVISOR} \
     --dataset ${DATASET} \
     --max_seq_len ${MAX_SEQ_LEN}"
-[[ "${NO_KV_CACHE}" == "true" ]] && TRAIN_CMD="${TRAIN_CMD} --no_kv_cache"
-
-IS_HPC=false
-[[ "${PLATFORM}" == "cispa" || "${PLATFORM}" == "julich" || "${PLATFORM}" == "jureca" ]] && IS_HPC=true
+    [[ "${NO_KV_CACHE}" == "true" ]] && TRAIN_CMD="${TRAIN_CMD} --no_kv_cache"
+fi
 
 # =============================================================================
 # Plan
 # =============================================================================
 
 echo "============================================================"
-echo "RecursiveMAS Outer-Link Training  [platform: ${PLATFORM}]"
-$IS_HPC && echo "Mode: HPC — SLURM job" || echo "Mode: local"
-echo "------------------------------------------------------------"
-echo "n_rounds:     ${N_ROUNDS}"
-echo "latent_steps: ${LATENT_STEPS}"
-echo "batch_size:   ${BATCH_SIZE}"
-echo "steps:        ${STEPS}"
-echo "lr:           ${LR}   dtype: ${DTYPE}"
-echo "mode:         ${MODE}  (n_experts=${N_EXPERTS}  expert_dim_divisor=${EXPERT_DIM_DIVISOR})"
-echo "dataset:      ${DATASET}   max_seq_len: ${MAX_SEQ_LEN}"
-echo "GPUs:         ${NUM_GPUS}   nodes: ${NUM_NODES}"
-echo "Script:       ${TRAIN_SCRIPT}"
+if [[ "${EVAL}" == "true" ]]; then
+    echo "RecursiveMAS Evaluation  [platform: ${PLATFORM}]"
+    $IS_HPC && echo "Mode: HPC — SLURM job" || echo "Mode: local"
+    echo "------------------------------------------------------------"
+    echo "ckpt_path:    ${CKPT_PATH}"
+    echo "eval_style:   ${EVAL_STYLE}"
+    echo "dataset:      ${EVAL_DATASET}   batch_size: ${EVAL_BATCH_SIZE}   seed: ${EVAL_SEED}"
+    echo "Script:       ${EVAL_SCRIPT}"
+else
+    echo "RecursiveMAS Outer-Link Training  [platform: ${PLATFORM}]"
+    $IS_HPC && echo "Mode: HPC — SLURM job" || echo "Mode: local"
+    echo "------------------------------------------------------------"
+    echo "n_rounds:     ${N_ROUNDS}"
+    echo "latent_steps: ${LATENT_STEPS}"
+    echo "batch_size:   ${BATCH_SIZE}"
+    echo "steps:        ${STEPS}"
+    echo "lr:           ${LR}   dtype: ${DTYPE}"
+    echo "mode:         ${MODE}  (n_experts=${N_EXPERTS}  expert_dim_divisor=${EXPERT_DIM_DIVISOR})"
+    echo "dataset:      ${DATASET}   max_seq_len: ${MAX_SEQ_LEN}"
+    echo "GPUs:         ${NUM_GPUS}   nodes: ${NUM_NODES}"
+    echo "Script:       ${TRAIN_SCRIPT}"
+fi
 echo "============================================================"
 
 # =============================================================================
 # Dispatch
 # =============================================================================
 
-s="${SLURM_JOB_DIR}/${TIMESTAMP}_recursivemas_r${N_ROUNDS}_s${STEPS}.sh"
+if [[ "${EVAL}" == "true" ]]; then
+    _job_tag="${TIMESTAMP}_eval_${EVAL_STYLE}"
+else
+    _job_tag="${TIMESTAMP}_recursivemas_r${N_ROUNDS}_s${STEPS}"
+fi
+s="${SLURM_JOB_DIR}/${_job_tag}.sh"
 
 if $IS_HPC; then
     case "${PLATFORM}" in
@@ -180,16 +255,18 @@ if $IS_HPC; then
             ;;
     esac
 else
-    # Local: run directly with torchrun
-    MASTER_PORT=$((10000 + RANDOM % 20000))
     export HF_TOKEN="${HF_TOKEN}"
     export OMP_NUM_THREADS=8
     export TOKENIZERS_PARALLELISM=false
 
     cd "${PROJ_DIR}"
 
-    if [[ ${NUM_GPUS} -gt 1 ]]; then
+    if [[ "${EVAL}" == "true" ]]; then
+        echo "Launching eval (single process)..."
+        python ${TRAIN_CMD}
+    elif [[ ${NUM_GPUS} -gt 1 ]]; then
         echo "Launching torchrun with ${NUM_GPUS} GPUs (pipeline parallelism)..."
+        MASTER_PORT=$((10000 + RANDOM % 20000))
         torchrun \
             --standalone \
             --nproc_per_node=${NUM_GPUS} \
