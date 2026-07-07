@@ -66,7 +66,7 @@ from typing import Dict, List, Optional, Tuple
 # `python train_outerlinks_math500.py` for single-GPU runs. Offline mode is
 # left to the caller/environment (e.g. SLURM exports HF_HUB_OFFLINE=1).
 os.environ.setdefault("HF_HOME", "/p/project1/hai_1354/hf_cache")
-os.environ.setdefault("HF_HUB_CACHE", os.environ["HF_HOME"])
+os.environ.setdefault("HF_HUB_CACHE", os.path.join(os.environ["HF_HOME"], "hub"))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -355,18 +355,29 @@ def load_training_problems(name: str, n_samples: int = 0, seed: int = 42):
     math).  Call strip_source() on the result when source tags are no longer needed.
     """
     keys = [k.strip().lower() for k in name.split("+") if k.strip()]
-    pools = []
+    if not keys:
+        raise ValueError(f"Empty dataset name: '{name}'")
     for k in keys:
         if k not in DATASET_LOADERS:
             raise ValueError(f"Unknown dataset '{k}'. Choices: {sorted(DATASET_LOADERS)}")
-        pairs = DATASET_LOADERS[k](n_samples=0, seed=seed)  # load full pool, truncate after merge
+
+    # Per-dataset quota: divide n_samples evenly; distribute remainder to first datasets.
+    n_datasets = len(keys)
+    if n_samples > 0:
+        base   = n_samples // n_datasets
+        extras = n_samples %  n_datasets          # first `extras` datasets get base+1
+        quotas = [base + (1 if i < extras else 0) for i in range(n_datasets)]
+    else:
+        quotas = [0] * n_datasets                 # 0 = load full dataset
+
+    pools = []
+    for k, quota in zip(keys, quotas):
+        pairs = DATASET_LOADERS[k](n_samples=quota, seed=seed)
         pools.append([(q, a, k) for q, a in pairs])
 
     combined = [p for pool in pools for p in pool]
     rng = np.random.default_rng(seed)
     rng.shuffle(combined)
-    if n_samples > 0:
-        combined = combined[:n_samples]
     return combined
 
 
@@ -1307,15 +1318,17 @@ def eval_probe(
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
-def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
+def run_training(cfg, device: torch.device, mode: str = "original",
+                 use_round_skip: bool = True) -> Dict:
     rank  = _rank()
     world = _world()
     _dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     dtype = _dtype_map[getattr(cfg, "dtype", "float32")]
 
     if rank == 0:
+        skip_tag = "" if use_round_skip else "  round_skip=OFF"
         print(f"\nDevice: {device}  |  world={world}  |  n_rounds={cfg.n_rounds}"
-              f"  latent_steps={cfg.latent_steps}  steps={cfg.steps}  mode={mode}")
+              f"  latent_steps={cfg.latent_steps}  steps={cfg.steps}  mode={mode}{skip_tag}")
 
     # ── Load models: each rank loads only what it owns ───────────────────────
     rp = _pipeline_rank("planner")
@@ -1326,10 +1339,13 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     critic_mdl  = critic_tok  = critic_inner  = None
     solver_mdl  = solver_tok  = solver_inner  = None
 
+    grad_checkpoint = getattr(cfg, "grad_checkpoint", False)
+
     if rank == rp:
         if rank == 0: print("Loading Planner...")
         planner_mdl, planner_tok = load_model_and_tokenizer(PLANNER_REPO, device, dtype)
-        # planner_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if grad_checkpoint:
+            planner_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         if mode != "shared_roae":
             planner_inner = load_inner_adapter(PLANNER_REPO, PLANNER_DIM, device, dtype)
             for p in planner_inner.parameters(): p.requires_grad_(False)
@@ -1337,7 +1353,8 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     if rank == rc:
         if rank == 0: print("Loading Critic...")
         critic_mdl, critic_tok = load_model_and_tokenizer(CRITIC_REPO, device, dtype)
-        # critic_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if grad_checkpoint:
+            critic_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         if mode != "shared_roae":
             critic_inner = load_inner_adapter(CRITIC_REPO, CRITIC_DIM, device, dtype)
             for p in critic_inner.parameters(): p.requires_grad_(False)
@@ -1345,7 +1362,8 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     if rank == rs:
         if rank == 0: print("Loading Solver...")
         solver_mdl, solver_tok = load_model_and_tokenizer(SOLVER_REPO, device, dtype)
-        # solver_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if grad_checkpoint:
+            solver_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         if mode != "shared_roae":
             solver_inner = load_inner_adapter(SOLVER_REPO, SOLVER_DIM, device, dtype)
             for p in solver_inner.parameters(): p.requires_grad_(False)
@@ -1358,16 +1376,21 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
 
     if mode == "shared_roae":
         hidden_dims = [PLANNER_DIM, CRITIC_DIM, SOLVER_DIM]
-        shared_dim  = 512
+        shared_dim  = 1024
         shared_link = SharedRecursiveLink(
             hidden_dims=hidden_dims,
             shared_dim=shared_dim,
             n_experts=getattr(cfg, "n_experts", 4),
             expert_dim_divisor=getattr(cfg, "expert_dim_divisor", 4),
         ).to(device=device, dtype=dtype).train()
+        if not use_round_skip:
+            # Ablation: freeze beta=0 so round-skip is disabled throughout training.
+            shared_link.beta.data.zero_()
+            shared_link.beta.requires_grad_(False)
         if rank == 0:
             n_sl = sum(p.numel() for p in shared_link.parameters() if p.requires_grad)
-            print(f"SharedRecursiveLink trainable params: {n_sl:,}  (shared dim={shared_dim})")
+            print(f"SharedRecursiveLink trainable params: {n_sl:,}  (shared dim={shared_dim})"
+                  f"  round_skip={'on' if use_round_skip else 'OFF'}")
     else:
         # Randomly initialise outer links — only these are trained; pretrained
         # weights are intentionally NOT loaded so the adapters start from scratch.
@@ -1413,6 +1436,84 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
         if optimizer is not None else None
     )
 
+    # Initialise here so the resume block can overwrite them before the loop.
+    losses: List[float] = []
+    rng = np.random.default_rng(cfg.seed)
+
+    # ── Resume from checkpoint ───────────────────────────────────────────────
+    _resume_ckpt_str = getattr(cfg, "resume_ckpt", "") or ""
+    resume_ckpt = Path(_resume_ckpt_str) if _resume_ckpt_str else None
+    start_step  = 0
+    if resume_ckpt is not None and resume_ckpt.is_dir():
+        if rank == 0:
+            print(f"\n[resume] Loading from {resume_ckpt}")
+
+        # Load adapter weights (same logic as fresh init but from saved state dicts).
+        if mode == "shared_roae" and shared_link is not None:
+            _w = resume_ckpt / "shared_recursive_link.pt"
+            if _w.is_file():
+                sd = torch.load(str(_w), map_location=device)
+                if "beta" not in sd:
+                    sd["beta"] = torch.tensor(1e-3)
+                shared_link.load_state_dict(sd, strict=True)
+                if rank == 0:
+                    print(f"  [resume] loaded shared_recursive_link.pt")
+            elif rank == 0:
+                print(f"  [resume] WARNING: shared_recursive_link.pt not found — weights not restored")
+        else:
+            def _load_adapter(adapter, fname):
+                p = resume_ckpt / fname
+                if adapter is not None and p.is_file():
+                    adapter.load_state_dict(torch.load(str(p), map_location=device), strict=True)
+                    if rank == 0:
+                        print(f"  [resume] loaded {fname}")
+            _load_adapter(outer_12, "Planner-Critic-Outerlink(math).pt")
+            _load_adapter(outer_23, "Critic-Solver-Outerlink(math).pt")
+            _load_adapter(outer_31, "Solver-Planner-Outerlink(math).pt")
+
+        # Load per-rank optimizer + scheduler state.
+        rank_file = resume_ckpt / f"resume_rank{rank}.pt"
+        if rank_file.is_file():
+            rank_state = torch.load(str(rank_file), map_location=device)
+            if optimizer is not None and rank_state.get("optimizer") is not None:
+                optimizer.load_state_dict(rank_state["optimizer"])
+            if scheduler is not None and rank_state.get("scheduler") is not None:
+                scheduler.load_state_dict(rank_state["scheduler"])
+            if rank == 0:
+                print(f"  [resume] loaded optimizer/scheduler for rank {rank}")
+
+        # Load global state (losses history, rng, step) — rank 0 reads and broadcasts.
+        global_file = resume_ckpt / "resume_global.pt"
+        if global_file.is_file():
+            if rank == 0:
+                global_state = torch.load(str(global_file), map_location="cpu")
+                _resume_step   = global_state.get("step", 0)
+                _resume_losses = global_state.get("losses", [])
+                _resume_rng    = global_state.get("rng")
+            else:
+                _resume_step   = 0
+                _resume_losses = []
+                _resume_rng    = None
+
+            # Broadcast step to all ranks so they all skip the same prefix.
+            if _is_dist():
+                _t = torch.tensor([_resume_step], dtype=torch.long, device=device)
+                dist.broadcast(_t, src=0)
+                _resume_step = int(_t.item())
+
+            start_step = _resume_step          # loop will start at start_step
+            if rank == 0:
+                losses = list(_resume_losses)
+                if _resume_rng is not None:
+                    rng.bit_generator.state = _resume_rng
+                print(f"  [resume] resuming from step {start_step}  "
+                      f"({cfg.steps - start_step} steps remaining)")
+        _barrier()
+    elif _resume_ckpt_str:
+        if rank == 0:
+            print(f"[resume] WARNING: resume_ckpt='{_resume_ckpt_str}' is not a valid directory — "
+                  f"starting from scratch.")
+
     # ── Dataset (all ranks load, each picks the same sample via shared seed) ─
     dataset_name = getattr(cfg, "dataset", "math500")
     if rank == 0:
@@ -1435,9 +1536,7 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
     _barrier()
 
     # ── Training ─────────────────────────────────────────────────────────────
-    losses: List[float] = []
     monitor = GradMonitor(cfg.n_rounds) if rank == rp else None
-    rng     = np.random.default_rng(cfg.seed)
 
     if rank == 0:
         print(f"\n{'='*70}")
@@ -1447,124 +1546,162 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
 
     pipeline = _is_dist() and (rp != rc or rc != rs)
 
-    B = cfg.batch_size
+    B          = cfg.batch_size
+    grad_accum = max(1, getattr(cfg, "grad_accum", 1))
+    n_ckpt     = max(1, getattr(cfg, "n_ckpt", 1))
+    ckpt_interval = max(1, cfg.steps // n_ckpt)
 
     def _zero_like_grad(shape, dt, dev):
         return torch.zeros(shape, dtype=dt, device=dev)
 
-    for step in range(cfg.steps):
+    _ckpt_suffix = ""
+    if mode == "shared_roae":
+        _ckpt_suffix = "_skip" if use_round_skip else "_noskip"
+
+    import datetime as _dt
+    _run_ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for step in range(start_step, cfg.steps):
 
         if optimizer is not None:
             optimizer.zero_grad()
 
-        # ── Sample a batch of B problems ─────────────────────────────────────
-        idxs      = rng.integers(len(problems), size=B)
-        questions = [problems[i][0] for i in idxs]
-        answers   = [problems[i][1] for i in idxs]
+        _accum_loss_scalars: List[float] = []
 
-        # ── Forward: all n rounds (paper Eq.6: L_out = CE(S^n(...S^1(x)), y)) ─
-        feedback_prefix = None
-        rounds = []
+        for _accum in range(grad_accum):
 
-        for r in range(cfg.n_rounds):
-            out = forward_one_round(
-                planner_mdl, planner_tok, planner_inner,
-                critic_mdl,  critic_tok,  critic_inner,
-                solver_mdl,  solver_tok,  solver_inner,
-                outer_12, outer_23, outer_31,
-                questions=questions,
-                answers=answers,
-                feedback_prefix=feedback_prefix,
-                latent_steps=cfg.latent_steps,
-                device=device,
-                dtype=dtype,
-                monitor=monitor,
-                round_idx=r,
-                shared_link=shared_link,
-                is_last_round=(r == cfg.n_rounds - 1),
-            )
-            rounds.append(out)
+            # ── Sample a micro-batch of B problems ───────────────────────────
+            idxs      = rng.integers(len(problems), size=B)
+            questions = [problems[i][0] for i in idxs]
+            answers   = [problems[i][1] for i in idxs]
 
-            if r < cfg.n_rounds - 1:
-                if pipeline and rs != rp:
-                    if rank == rs:
-                        _send_tensor(out["feedback"], dst=rp)
-                    if rank == rp:
-                        feedback_prefix = _recv_tensor(src=rs, device=device, dtype=dtype,
-                                                       requires_grad=True,
-                                                       shape=(B, cfg.latent_steps, PLANNER_DIM))
-                        if feedback_prefix.requires_grad:
-                            feedback_prefix.retain_grad()
-                        out["fb_recv"] = feedback_prefix
-                else:
-                    feedback_prefix = out.get("feedback")
+            # ── Forward: all n rounds (paper Eq.6: L_out = CE(S^n(...S^1(x)), y)) ─
+            feedback_prefix = None
+            # Round-skip (shared_roae only): round-0 feedback is kept as a direct
+            # highway into every subsequent round.  Detached so it acts as a fixed
+            # anchor; beta (on SharedRecursiveLink) learns the blend weight.
+            initial_feedback = None
+            rounds = []
 
-        # ── Loss: already computed inside forward_one_round (mean over batch) ─
-        last = rounds[-1]
-        loss = last.get("solver_loss") if rank == rs else None
+            for r in range(cfg.n_rounds):
+                out = forward_one_round(
+                    planner_mdl, planner_tok, planner_inner,
+                    critic_mdl,  critic_tok,  critic_inner,
+                    solver_mdl,  solver_tok,  solver_inner,
+                    outer_12, outer_23, outer_31,
+                    questions=questions,
+                    answers=answers,
+                    feedback_prefix=feedback_prefix,
+                    latent_steps=cfg.latent_steps,
+                    device=device,
+                    dtype=dtype,
+                    monitor=monitor,
+                    round_idx=r,
+                    shared_link=shared_link,
+                    is_last_round=(r == cfg.n_rounds - 1),
+                )
+                rounds.append(out)
 
-        # ── Backward: explicit, barrier-separated pipeline grad exchange ──────
-        if not pipeline:
-            if loss is not None:
-                loss.backward()
-        else:
-            for r in range(cfg.n_rounds - 1, -1, -1):
-                o = rounds[r]
-                is_last_backward = (r == 0)
-
-                # Step A ── rs: backward through local solver graph ────────────
-                if rank == rs:
-                    if r == cfg.n_rounds - 1:
-                        if loss is not None:
-                            loss.backward(retain_graph=not is_last_backward)
+                if r < cfg.n_rounds - 1:
+                    if pipeline and rs != rp:
+                        if rank == rs:
+                            _send_tensor(out["feedback"], dst=rp)
+                        if rank == rp:
+                            feedback_prefix = _recv_tensor(src=rs, device=device, dtype=dtype,
+                                                           requires_grad=True,
+                                                           shape=(B, cfg.latent_steps, PLANNER_DIM))
+                            if feedback_prefix.requires_grad:
+                                feedback_prefix.retain_grad()
+                            out["fb_recv"] = feedback_prefix
                     else:
-                        g_fb = rounds[r + 1].get("g_fb_for_prev")
-                        fb   = o.get("feedback")
-                        if fb is not None and g_fb is not None:
-                            fb.backward(g_fb, retain_graph=not is_last_backward)
+                        feedback_prefix = out.get("feedback")
 
-                # Step B ── rs→rc grad ─────────────────────────────────────────
-                if rank == rs:
-                    sp_recv = o.get("sp_recv")
-                    g = (sp_recv.grad if (sp_recv is not None and sp_recv.grad is not None)
-                         else _zero_like_grad((B, cfg.latent_steps, SOLVER_DIM), dtype, device))
-                    _send_tensor(g, dst=rc)
+                    # Round-skip: on rank-rp, blend round-0 feedback into subsequent
+                    # rounds via the learnable beta gate on SharedRecursiveLink.
+                    if shared_link is not None and rank == rp and feedback_prefix is not None:
+                        if r == 0:
+                            initial_feedback = feedback_prefix.detach()
+                        if initial_feedback is not None:
+                            feedback_prefix = feedback_prefix + shared_link.beta * initial_feedback
 
-                if rank == rc:
-                    sv_pfx = o.get("solver_prefix_rc")
-                    g = _recv_tensor(src=rs, device=device, dtype=dtype,
-                                     shape=(B, cfg.latent_steps, SOLVER_DIM))
-                    if sv_pfx is not None:
-                        sv_pfx.backward(g, retain_graph=not is_last_backward)
+            # ── Loss: already computed inside forward_one_round (mean over batch) ─
+            last = rounds[-1]
+            loss = last.get("solver_loss") if rank == rs else None
 
-                # Step C ── rc→rp grad ─────────────────────────────────────────
-                if rank == rc:
-                    cp_recv = o.get("cp_recv")
-                    g = (cp_recv.grad if (cp_recv is not None and cp_recv.grad is not None)
-                         else _zero_like_grad((B, cfg.latent_steps, CRITIC_DIM), dtype, device))
-                    _send_tensor(g, dst=rp)
+            # Scale loss for accumulation so each micro-batch contributes equally.
+            if loss is not None:
+                loss = loss / grad_accum
 
-                if rank == rp:
-                    cr_pfx = o.get("critic_prefix")
-                    g = _recv_tensor(src=rc, device=device, dtype=dtype,
-                                     shape=(B, cfg.latent_steps, CRITIC_DIM))
-                    if cr_pfx is not None:
-                        cr_pfx.backward(g, retain_graph=not is_last_backward)
+            # ── Backward: explicit, barrier-separated pipeline grad exchange ──
+            if not pipeline:
+                if loss is not None:
+                    loss.backward()
+            else:
+                for r in range(cfg.n_rounds - 1, -1, -1):
+                    o = rounds[r]
+                    is_last_backward = (r == 0)
 
-                # Step D ── rp→rs feedback grad (rounds r>0 only) ──────────────
-                if r > 0 and pipeline and rs != rp:
-                    if rank == rp:
-                        fb_recv = rounds[r - 1].get("fb_recv")
-                        g = (fb_recv.grad if (fb_recv is not None and fb_recv.grad is not None)
-                             else _zero_like_grad((B, cfg.latent_steps, PLANNER_DIM), dtype, device))
-                        _send_tensor(g, dst=rs)
+                    # Step A ── rs: backward through local solver graph ────────
                     if rank == rs:
-                        o["g_fb_for_prev"] = _recv_tensor(src=rp, device=device, dtype=dtype,
-                                                          shape=(B, cfg.latent_steps, PLANNER_DIM))
+                        if r == cfg.n_rounds - 1:
+                            if loss is not None:
+                                loss.backward(retain_graph=not is_last_backward)
+                        else:
+                            g_fb = rounds[r + 1].get("g_fb_for_prev")
+                            fb   = o.get("feedback")
+                            if fb is not None and g_fb is not None:
+                                fb.backward(g_fb, retain_graph=not is_last_backward)
+
+                    # Step B ── rs→rc grad ─────────────────────────────────────
+                    if rank == rs:
+                        sp_recv = o.get("sp_recv")
+                        g = (sp_recv.grad if (sp_recv is not None and sp_recv.grad is not None)
+                             else _zero_like_grad((B, cfg.latent_steps, SOLVER_DIM), dtype, device))
+                        _send_tensor(g, dst=rc)
+
+                    if rank == rc:
+                        sv_pfx = o.get("solver_prefix_rc")
+                        g = _recv_tensor(src=rs, device=device, dtype=dtype,
+                                         shape=(B, cfg.latent_steps, SOLVER_DIM))
+                        if sv_pfx is not None:
+                            sv_pfx.backward(g, retain_graph=not is_last_backward)
+
+                    # Step C ── rc→rp grad ─────────────────────────────────────
+                    if rank == rc:
+                        cp_recv = o.get("cp_recv")
+                        g = (cp_recv.grad if (cp_recv is not None and cp_recv.grad is not None)
+                             else _zero_like_grad((B, cfg.latent_steps, CRITIC_DIM), dtype, device))
+                        _send_tensor(g, dst=rp)
+
+                    if rank == rp:
+                        cr_pfx = o.get("critic_prefix")
+                        g = _recv_tensor(src=rc, device=device, dtype=dtype,
+                                         shape=(B, cfg.latent_steps, CRITIC_DIM))
+                        if cr_pfx is not None:
+                            cr_pfx.backward(g, retain_graph=not is_last_backward)
+
+                    # Step D ── rp→rs feedback grad (rounds r>0 only) ──────────
+                    if r > 0 and pipeline and rs != rp:
+                        if rank == rp:
+                            fb_recv = rounds[r - 1].get("fb_recv")
+                            g = (fb_recv.grad if (fb_recv is not None and fb_recv.grad is not None)
+                                 else _zero_like_grad((B, cfg.latent_steps, PLANNER_DIM), dtype, device))
+                            _send_tensor(g, dst=rs)
+                        if rank == rs:
+                            o["g_fb_for_prev"] = _recv_tensor(src=rp, device=device, dtype=dtype,
+                                                              shape=(B, cfg.latent_steps, PLANNER_DIM))
+
+            # Track the unscaled loss scalar for logging (multiply back by grad_accum).
+            _accum_loss_scalars.append(
+                (loss.item() * grad_accum) if loss is not None else float("nan")
+            )
+            del loss, rounds
+
+        # end grad_accum loop
 
         # ── Free forward graphs before sync/optimizer ────────────────────────
-        step_loss_scalar = loss.item() if loss is not None else float("nan")
-        del loss, rounds
+        _valid = [v for v in _accum_loss_scalars if not (v != v)]  # exclude nan
+        step_loss_scalar = (sum(_valid) / len(_valid)) if _valid else float("nan")
 
         # ── Sync loss scalar to rank 0 for logging ────────────────────────────
         if _is_dist():
@@ -1622,6 +1759,27 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
                 else:
                     print(f"  step {step:4d}  loss={step_loss:.4f}")
 
+        # ── Mid-training checkpoint ───────────────────────────────────────────
+        is_last_step = (step == cfg.steps - 1)
+        if (step + 1) % ckpt_interval == 0 or is_last_step:
+            ckpt_dir = save_checkpoint(
+                outer_12=outer_12,
+                outer_23=outer_23,
+                outer_31=outer_31,
+                shared_link=shared_link,
+                cfg=cfg,
+                mode=mode,
+                rank=rank,
+                ckpt_suffix=_ckpt_suffix,
+                step=step + 1,
+                run_ts=_run_ts,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                rng=rng,
+                losses=losses,
+            )
+            if rank == 0 and ckpt_dir is not None:
+                print(f"  [ckpt] step {step + 1}  →  {ckpt_dir}")
 
     # Gather results: collect norm history from rank_planner to rank 0
     if _is_dist() and rp != 0:
@@ -1642,19 +1800,6 @@ def run_training(cfg, device: torch.device, mode: str = "original") -> Dict:
             grad_norms = pickle.loads(bytes(data.cpu().numpy()))
     else:
         grad_norms = monitor.norms if monitor is not None else {r: [] for r in range(cfg.n_rounds)}
-
-    # ── Save checkpoint (rank 0 only; after all training steps) ─────────────
-    ckpt_dir = save_checkpoint(
-        outer_12=outer_12,
-        outer_23=outer_23,
-        outer_31=outer_31,
-        shared_link=shared_link,
-        cfg=cfg,
-        mode=mode,
-        rank=rank,
-    )
-    if rank == 0 and ckpt_dir is not None:
-        print(f"\n[ckpt] Saved {mode} checkpoint → {ckpt_dir}")
 
     # ── Free this run's models/optimizer before returning ────────────────────
     # `compare` mode calls run_training twice in the same process (original,
@@ -1683,6 +1828,13 @@ def save_checkpoint(
     cfg,
     mode: str,
     rank: int,
+    ckpt_suffix: str = "",
+    step: Optional[int] = None,
+    run_ts: Optional[str] = None,
+    optimizer=None,
+    scheduler=None,
+    rng=None,
+    losses: Optional[List[float]] = None,
 ) -> Optional[Path]:
     """
     Save trained outer-link weights so they can be loaded by run.py for evaluation.
@@ -1720,7 +1872,10 @@ def save_checkpoint(
     n_rounds   = cfg.n_rounds
     ckpt_root  = THIS_DIR / "outputs" / "checkpoints"
 
-    ckpt_dir = ckpt_root / f"{out_prefix}_{mode}_r{n_rounds}"
+    import datetime as _dt
+    ts = run_ts or _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    parent_dir = ckpt_root / f"{out_prefix}_{mode}_r{n_rounds}{ckpt_suffix}_{ts}"
+    ckpt_dir = parent_dir / (f"step_{step}" if step is not None else "step_final")
 
     # In pipeline mode each outer adapter lives on a different rank.
     # Gather all three state dicts to rank 0 via object broadcast before writing.
@@ -1769,6 +1924,26 @@ def save_checkpoint(
 
     if rank == 0:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        train_config = {
+            "mode":               mode,
+            "use_round_skip":     ckpt_suffix != "_noskip",
+            "n_rounds":           n_rounds,
+            "latent_steps":       getattr(cfg, "latent_steps", None),
+            "batch_size":         getattr(cfg, "batch_size", None),
+            "steps":              getattr(cfg, "steps", None),
+            "lr":                 getattr(cfg, "lr", None),
+            "dtype":              getattr(cfg, "dtype", None),
+            "n_experts":          getattr(cfg, "n_experts", None),
+            "expert_dim_divisor": getattr(cfg, "expert_dim_divisor", None),
+            "dataset":            getattr(cfg, "dataset", None),
+            "n_samples":          getattr(cfg, "n_samples", None),
+            "max_seq_len":        getattr(cfg, "max_seq_len", None),
+            "n_ckpt":             getattr(cfg, "n_ckpt", 1),
+            "saved_at_step":      step,
+        }
+        with open(ckpt_dir / "train_config.json", "w") as f:
+            _json.dump(train_config, f, indent=2)
 
         if mode == "original":
 
@@ -1836,6 +2011,32 @@ def save_checkpoint(
                 }
                 with open(ckpt_dir / "shared_roae_config.json", "w") as f:
                     _json.dump(config, f, indent=2)
+
+    # ── Resume state ─────────────────────────────────────────────────────────
+    # Every checkpoint is a full resume point: weights, optimizer, scheduler,
+    # loss history, rng state, and step counter are all written.
+    # ckpt_dir is only valid on rank 0; all ranks derive the same path.
+    _out_prefix = getattr(cfg, "out_prefix", "outerlink_grad")
+    _n_rounds   = cfg.n_rounds
+    _ts         = run_ts or ""
+    _ckpt_root  = THIS_DIR / "outputs" / "checkpoints"
+    _parent     = _ckpt_root / f"{_out_prefix}_{mode}_r{_n_rounds}{ckpt_suffix}_{_ts}"
+    _step_dir   = _parent / (f"step_{step}" if step is not None else "step_final")
+    _step_dir.mkdir(parents=True, exist_ok=True)
+
+    resume_rank = {
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+    }
+    torch.save(resume_rank, _step_dir / f"resume_rank{rank}.pt")
+
+    if rank == 0 and ckpt_dir is not None:
+        resume_global = {
+            "step":   step,
+            "losses": losses or [],
+            "rng":    rng.bit_generator.state if rng is not None else None,
+        }
+        torch.save(resume_global, ckpt_dir / "resume_global.pt")
 
     _barrier()
     return ckpt_dir if rank == 0 else None
@@ -1993,37 +2194,53 @@ def parse_args():
     p.add_argument("--max_seq_len", type=int, default=0,
                    help="Max combined (question+answer) sequence length in tokens "
                         "(approximate, char-based truncation). 0 = no truncation.")
-    p.add_argument("--n_samples", type=int, default=100)
+    p.add_argument("--n_samples", type=int, default=500)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_prefix", type=str, default="outerlink_grad")
     p.add_argument("--dtype", type=str, default="bfloat16",
                    choices=["bfloat16", "float16", "float32"])
     p.add_argument("--mode", type=str, default="original",
-                   choices=["original", "shared_roae", "compare"],
+                   choices=["original", "shared_roae", "compare", "compare_roundskip"],
                    help="original: independent CrossModelAdapters (default); "
                         "shared_roae: single SharedRecursiveLink with MoE + RoAE; "
-                        "compare: run both and plot side-by-side.")
+                        "compare: run both and plot side-by-side; "
+                        "compare_roundskip: shared_roae with vs without round-skip ablation.")
     p.add_argument("--n_experts", type=int, default=4,
                    help="Number of MoE experts (shared_roae mode only).")
     p.add_argument("--expert_dim_divisor", type=int, default=4,
                    help="Expert inner dim = shared_dim // expert_dim_divisor.")
+    p.add_argument("--no_round_skip", action="store_true", default=False,
+                   help="Disable the round-skip gate (beta=0, frozen) in shared_roae mode.")
+    p.add_argument("--n_ckpt", type=int, default=1,
+                   help="Number of checkpoints saved during training, evenly spaced. "
+                        "e.g. --steps 9 --n_ckpt 3 saves at steps 3, 6, 9.")
+    p.add_argument("--resume_ckpt", type=str, default="",
+                   help="Path to a step_N checkpoint directory containing resume_rank*.pt "
+                        "and resume_global.pt.  Training resumes from the saved step.")
+    p.add_argument("--grad_checkpoint", action="store_true", default=False,
+                   help="Enable gradient checkpointing to trade compute for activation memory.")
+    p.add_argument("--grad_accum", type=int, default=1,
+                   help="Gradient accumulation steps. Effective batch = batch_size * grad_accum.")
     return p.parse_args()
 
 
-def plot_compare(results_orig: Dict, results_shared: Dict, cfg, out_path: str) -> None:
-    """5-panel comparison: Original vs SharedLink-RoAE on real MATH-500 data."""
+def plot_compare(results_orig: Dict, results_shared: Dict, cfg, out_path: str,
+                 label_a: str = "Original (CrossModelAdapter)",
+                 label_b: str = "SharedLink-RoAE (MoE+RoPE)",
+                 title_tag: str = "Original vs SharedLink-RoAE") -> None:
+    """5-panel comparison plot."""
     n_rounds = cfg.n_rounds
     tail     = max(1, cfg.steps // 5)
     cmap     = plt.get_cmap("plasma")
 
     variants = [
-        ("Original (CrossModelAdapter)", results_orig,   "steelblue"),
-        ("SharedLink-RoAE (MoE+RoPE)",  results_shared, "mediumseagreen"),
+        (label_a, results_orig,   "steelblue"),
+        (label_b, results_shared, "mediumseagreen"),
     ]
 
     fig, axes = plt.subplots(1, 5, figsize=(28, 5))
     fig.suptitle(
-        f"RecursiveMAS-Light  |  Original vs SharedLink-RoAE  |  MATH-500\n"
+        f"RecursiveMAS-Light  |  {title_tag}  |  MATH-500\n"
         f"n_rounds={n_rounds}  latent_steps={cfg.latent_steps}  "
         f"steps={cfg.steps}  lr={cfg.lr}  world={_world()}\n"
         f"SharedLink: n_experts={cfg.n_experts}  expert_dim_divisor={cfg.expert_dim_divisor}",
@@ -2071,7 +2288,8 @@ def plot_compare(results_orig: Dict, results_shared: Dict, cfg, out_path: str) -
     ax.axhline(0.1, color="red",    linewidth=1, linestyle="--", label="vanish (0.1)")
     ax.axhline(10,  color="orange", linewidth=1, linestyle="--", label="explode (10)")
     ax.axhline(1.0, color="green",  linewidth=1, linestyle=":",  label="ideal (1.0)")
-    ax.set_xticks([0, 1]); ax.set_xticklabels(["Original", "SharedLink-RoAE"])
+    short_labels = [v[0].split("(")[0].strip() for v in variants]
+    ax.set_xticks([0, 1]); ax.set_xticklabels(short_labels, fontsize=7)
     ax.set_ylabel("Grad ratio  r1 / rN"); ax.set_title("Grad ratio (lower=vanishing)")
     ax.legend(fontsize=7); ax.grid(True, axis="y", alpha=0.3)
 
@@ -2101,7 +2319,9 @@ def plot_compare(results_orig: Dict, results_shared: Dict, cfg, out_path: str) -
     print(f"\nComparison plot saved → {out_path}")
 
 
-def _print_compare_summary(results_orig: Dict, results_shared: Dict, cfg) -> None:
+def _print_compare_summary(results_orig: Dict, results_shared: Dict, cfg,
+                           label_a: str = "Original (CrossModelAdapter)",
+                           label_b: str = "SharedLink-RoAE") -> None:
     rank  = _rank()
     if rank != 0:
         return
@@ -2109,10 +2329,10 @@ def _print_compare_summary(results_orig: Dict, results_shared: Dict, cfg) -> Non
     tail     = max(1, cfg.steps // 5)
 
     print(f"\n{'='*70}")
-    print("Comparison: Original vs SharedLink-RoAE  (last 20% of training)")
+    print(f"Comparison: {label_a} vs {label_b}  (last 20% of training)")
     print(f"{'='*70}")
-    for label, res in [("Original (CrossModelAdapter)", results_orig),
-                       ("SharedLink-RoAE",              results_shared)]:
+    for label, res in [(label_a, results_orig),
+                       (label_b, results_shared)]:
         print(f"\n  [{label}]")
         avg_norms = {}
         for r in range(n_rounds):
@@ -2148,11 +2368,11 @@ def main():
     sweep      = len(round_list) > 1
     mode       = cfg.mode
 
-    def _run_single(n_rounds_val: int, run_mode: str):
+    def _run_single(n_rounds_val: int, run_mode: str, use_round_skip: bool = True):
         """Helper: run one (n_rounds, mode) combination and return results."""
         cfg_n = copy.copy(cfg)
         cfg_n.n_rounds = n_rounds_val
-        return run_training(cfg_n, device, mode=run_mode)
+        return run_training(cfg_n, device, mode=run_mode, use_round_skip=use_round_skip)
 
     if mode == "compare":
         # Run original then shared_roae and produce a side-by-side plot.
@@ -2182,9 +2402,45 @@ def main():
                     plot_compare(r_orig, r_shared, cfg_n,
                                  out_path=f"{cfg.out_prefix}_compare_r{n}.png")
 
+    elif mode == "compare_roundskip":
+        # Ablation: SharedRecursiveLink with vs without round-skip (beta gate).
+        _LA = "SharedLink+RoundSkip"
+        _LB = "SharedLink (no skip)"
+        if not sweep:
+            cfg.n_rounds = round_list[0]
+            if rank == 0:
+                print("\n" + "=" * 70)
+                print("  COMPARE_ROUNDSKIP — SharedLink with vs without round-skip")
+                print("=" * 70)
+            results_skip   = _run_single(cfg.n_rounds, "shared_roae", use_round_skip=True)
+            results_noskip = _run_single(cfg.n_rounds, "shared_roae", use_round_skip=False)
+            if rank == 0:
+                analyse(results_skip,   cfg)
+                analyse(results_noskip, cfg)
+                _print_compare_summary(results_skip, results_noskip, cfg,
+                                       label_a=_LA, label_b=_LB)
+                out = f"{cfg.out_prefix}_roundskip_r{cfg.n_rounds}.png"
+                plot_compare(results_skip, results_noskip, cfg, out_path=out,
+                             label_a=_LA, label_b=_LB,
+                             title_tag="SharedLink: Round-Skip vs No-Skip")
+        else:
+            for n in round_list:
+                if rank == 0:
+                    print(f"\n{'='*70}  n_rounds={n}  {'='*70}")
+                r_skip   = _run_single(n, "shared_roae", use_round_skip=True)
+                r_noskip = _run_single(n, "shared_roae", use_round_skip=False)
+                cfg_n = copy.copy(cfg); cfg_n.n_rounds = n
+                if rank == 0:
+                    _print_compare_summary(r_skip, r_noskip, cfg_n,
+                                           label_a=_LA, label_b=_LB)
+                    plot_compare(r_skip, r_noskip, cfg_n,
+                                 out_path=f"{cfg.out_prefix}_roundskip_r{n}.png",
+                                 label_a=_LA, label_b=_LB,
+                                 title_tag="SharedLink: Round-Skip vs No-Skip")
+
     elif not sweep:
         cfg.n_rounds = round_list[0]
-        results = _run_single(cfg.n_rounds, mode)
+        results = _run_single(cfg.n_rounds, mode, use_round_skip=not cfg.no_round_skip)
         if rank == 0:
             analyse(results, cfg)
             plot_single(results, cfg,
@@ -2192,7 +2448,7 @@ def main():
     else:
         sweep_results = []
         for n in round_list:
-            results = _run_single(n, mode)
+            results = _run_single(n, mode, use_round_skip=not cfg.no_round_skip)
             cfg_n = copy.copy(cfg); cfg_n.n_rounds = n
             if rank == 0:
                 analyse(results, cfg_n)

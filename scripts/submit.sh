@@ -49,12 +49,18 @@ Training options:
   --steps N               Training steps                          (default: 100)
   --lr LR                 Learning rate                           (default: 1e-4)
   --dtype DTYPE           bfloat16 | float16 | float32            (default: bfloat16)
-  --mode MODE             original | shared_roae | compare        (default: original)
+  --mode MODE             original | shared_roae | compare | compare_roundskip  (default: original)
   --n_experts N           MoE experts (shared_roae/compare only)  (default: 4)
   --expert_dim_divisor N  Expert inner dim divisor                (default: 4)
   --no_kv_cache           Disable KV cache in latent rollout      (required for latent_steps>=20)
+  --no_round_skip         Disable round-skip gate (beta=0, frozen); shared_roae mode only
   --dataset NAME          math500 | s1k | m1k | s1k+m1k (pooled)  (default: math500)
   --max_seq_len N         Max combined Q+A length in tokens (0=off) (default: 0)
+  --n_samples N           Training problems per epoch (0=full dataset) (default: 500)
+  --n_ckpt N              Checkpoints saved during training, evenly spaced (default: 1)
+  --resume_ckpt PATH      step_N checkpoint dir to resume from (default: empty = fresh start)
+  --grad_checkpoint       Enable gradient checkpointing (saves activation memory, ~33% slower)
+  --grad_accum N          Gradient accumulation steps; effective batch = batch_size * N (default: 1)
 
 Infrastructure:
   --gpus N              GPUs per SLURM job               (default: 3)
@@ -78,6 +84,9 @@ Examples:
 
   # CISPA, compare both methods side-by-side
   ./submit.sh --n_rounds 3 --steps 100 --mode compare
+
+  # Ablation: SharedLink with vs without round-skip
+  ./submit.sh --n_rounds 3 --steps 100 --mode compare_roundskip
 
   # CISPA, SharedLink-RoAE only with larger MoE
   ./submit.sh --n_rounds 3 --steps 100 --mode shared_roae --n_experts 8
@@ -106,8 +115,14 @@ while [[ $# -gt 0 ]]; do
         --n_experts)          N_EXPERTS="$2";          shift 2 ;;
         --expert_dim_divisor) EXPERT_DIM_DIVISOR="$2"; shift 2 ;;
         --no_kv_cache)        NO_KV_CACHE=true;        shift ;;
+        --no_round_skip)      USE_ROUND_SKIP=false;    shift ;;
+        --n_ckpt)             N_CKPT="$2";             shift 2 ;;
+        --resume_ckpt)        RESUME_CKPT="$2";        shift 2 ;;
+        --grad_checkpoint)    GRAD_CHECKPOINT=true;    shift ;;
+        --grad_accum)         GRAD_ACCUM="$2";         shift 2 ;;
         --dataset)            DATASET="$2";            shift 2 ;;
         --max_seq_len)        MAX_SEQ_LEN="$2";        shift 2 ;;
+        --n_samples)          N_SAMPLES="$2";          shift 2 ;;
         --gpus)               NUM_GPUS="$2";           shift 2 ;;
         --nodes)              NUM_NODES="$2";          shift 2 ;;
         --partition)          PARTITION="$2";          shift 2 ;;
@@ -126,6 +141,8 @@ done
 # config.sh or the user set them (true/True/TRUE all accepted).
 EVAL="${EVAL,,}"
 NO_KV_CACHE="${NO_KV_CACHE,,}"
+USE_ROUND_SKIP="${USE_ROUND_SKIP,,}"
+GRAD_CHECKPOINT="${GRAD_CHECKPOINT,,}"
 
 # =============================================================================
 # Setup
@@ -183,8 +200,14 @@ else
     --n_experts ${N_EXPERTS} \
     --expert_dim_divisor ${EXPERT_DIM_DIVISOR} \
     --dataset ${DATASET} \
-    --max_seq_len ${MAX_SEQ_LEN}"
-    [[ "${NO_KV_CACHE}" == "true" ]] && TRAIN_CMD="${TRAIN_CMD} --no_kv_cache"
+    --max_seq_len ${MAX_SEQ_LEN} \
+    --n_samples ${N_SAMPLES} \
+    --n_ckpt ${N_CKPT}"
+    [[ "${NO_KV_CACHE}" == "true" ]]      && TRAIN_CMD="${TRAIN_CMD} --no_kv_cache"
+    [[ "${USE_ROUND_SKIP}" == "false" ]]  && TRAIN_CMD="${TRAIN_CMD} --no_round_skip"
+    [[ -n "${RESUME_CKPT}" ]]             && TRAIN_CMD="${TRAIN_CMD} --resume_ckpt ${RESUME_CKPT}"
+    [[ "${GRAD_CHECKPOINT}" == "true" ]]  && TRAIN_CMD="${TRAIN_CMD} --grad_checkpoint"
+    [[ "${GRAD_ACCUM}" -gt 1 ]] 2>/dev/null && TRAIN_CMD="${TRAIN_CMD} --grad_accum ${GRAD_ACCUM}"
 fi
 
 # =============================================================================
@@ -209,8 +232,10 @@ else
     echo "batch_size:   ${BATCH_SIZE}"
     echo "steps:        ${STEPS}"
     echo "lr:           ${LR}   dtype: ${DTYPE}"
-    echo "mode:         ${MODE}  (n_experts=${N_EXPERTS}  expert_dim_divisor=${EXPERT_DIM_DIVISOR})"
-    echo "dataset:      ${DATASET}   max_seq_len: ${MAX_SEQ_LEN}"
+    echo "mode:         ${MODE}  (n_experts=${N_EXPERTS}  expert_dim_divisor=${EXPERT_DIM_DIVISOR}  round_skip=${USE_ROUND_SKIP})"
+    echo "dataset:      ${DATASET}   max_seq_len: ${MAX_SEQ_LEN}   n_samples: ${N_SAMPLES}   n_ckpt: ${N_CKPT}"
+    [[ -n "${RESUME_CKPT}" ]] && echo "resume_ckpt:  ${RESUME_CKPT}"
+    echo "grad_checkpoint: ${GRAD_CHECKPOINT}   grad_accum: ${GRAD_ACCUM}"
     echo "GPUs:         ${NUM_GPUS}   nodes: ${NUM_NODES}"
     echo "Script:       ${TRAIN_SCRIPT}"
 fi

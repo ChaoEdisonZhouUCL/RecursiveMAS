@@ -183,12 +183,20 @@ class SharedRecursiveLink(nn.Module):
     Single shared cross-model adapter for all pipeline transitions.
 
     Architecture:
-      - Per-agent in/out linear projections to/from a shared latent space.
+      - Per-agent in_proj  (hidden_dims[src] → shared_dim, with bias).
+      - Per-agent skip_proj (hidden_dims[src] → shared_dim, no bias) — gradient
+        highway that lives entirely in latent space, shared across all dst agents.
       - RoAE: rotary position encoding per agent index so the shared MoE core
         can distinguish "planner→critic" from "solver→planner", etc.
       - Soft-MoE with n_experts experts dispatched by an RoAE-conditioned router.
-      - ReZero gate (alpha): starts as a pure skip connection.
-      - Direct skip_proj in native hidden spaces for a gradient highway.
+      - ReZero gate (alpha): MoE output starts near zero, skip dominates early.
+      - Per-agent out_proj (shared_dim → hidden_dims[dst]) applied to the sum
+        (skip + alpha * MoE), so a single out_proj handles all src agents.
+
+    Forward: out_proj[dst]( skip_proj[src](h) + alpha * MoE(in_proj[src](h)) )
+
+    This moves the skip connection into latent space (N projections, not N×N),
+    reducing parameters while keeping a gradient highway through every transition.
 
     Agents are 1-indexed: 1=Planner, 2=Critic, 3=Solver.
     """
@@ -204,22 +212,20 @@ class SharedRecursiveLink(nn.Module):
         N = len(hidden_dims)
         d = shared_dim
 
+        # index 0 unused (Identity placeholder keeps 1-based agent indexing)
         self.in_proj = nn.ModuleList(
             [nn.Identity()] + [nn.Linear(h, d) for h in hidden_dims]
         )
         self.out_proj = nn.ModuleList(
             [nn.Identity()] + [nn.Linear(d, h) for h in hidden_dims]
         )
-        self.skip_proj = nn.ModuleList([
-            nn.ModuleList([
-                nn.Linear(hidden_dims[i], hidden_dims[j], bias=False)
-                for j in range(N)
-            ])
-            for i in range(N)
-        ])
-        for i in range(N):
-            for j in range(N):
-                nn.init.orthogonal_(self.skip_proj[i][j].weight)
+        # One projection per source agent: hidden_dims[src] → d, no bias.
+        # Shared across all dst agents; dst-specificity comes from out_proj.
+        self.skip_proj = nn.ModuleList(
+            [nn.Identity()] + [nn.Linear(h, d, bias=False) for h in hidden_dims]
+        )
+        for proj in self.skip_proj[1:]:
+            nn.init.orthogonal_(proj.weight)
 
         self.router    = nn.Linear(3 * d, n_experts, bias=False)
         exp_hidden = max(1, d // expert_dim_divisor)
@@ -232,6 +238,10 @@ class SharedRecursiveLink(nn.Module):
         self.act   = nn.GELU()
         self.ln_in = nn.LayerNorm(d)
         self.alpha = nn.Parameter(torch.tensor(1e-3))
+        # Round-skip gate: blends round-0 cyclic output into every subsequent
+        # round's feedback prefix.  ReZero-init so early training is identical
+        # to the no-skip baseline; the model learns how much to blend in.
+        self.beta  = nn.Parameter(torch.tensor(1e-3))
 
         self._rope_cache: dict = {}
 
@@ -244,8 +254,8 @@ class SharedRecursiveLink(nn.Module):
 
     def forward(self, h: torch.Tensor, src: int, dst: int) -> torch.Tensor:
         """h: (B, T, hidden_dims[src-1]);  src/dst are 1-indexed agent indices."""
-        src0, dst0 = src - 1, dst - 1
-        skip = self.skip_proj[src0][dst0](h)
+        # Skip connection in latent space: hidden_dims[src] → d
+        skip = self.skip_proj[src](h)
 
         x = self.in_proj[src](h)
         cos_tab, sin_tab = self._get_rope(x.device, x.dtype)
@@ -264,7 +274,8 @@ class SharedRecursiveLink(nn.Module):
         h1 = self.act(torch.einsum("btd,kde->btke", normed, W1) + b1)
         h2 = (torch.einsum("btke,ked->btd", h1 * w.unsqueeze(-1), W2)
               + (w @ b2).squeeze(1).unsqueeze(1))
-        return skip + self.alpha * self.out_proj[dst](h2)
+        # Combine in latent space, then project to dst hidden dim
+        return self.out_proj[dst](skip + self.alpha * h2)
 
 
 def load_shared_recursive_link(
@@ -297,6 +308,10 @@ def load_shared_recursive_link(
         expert_dim_divisor=cfg.get("expert_dim_divisor", 4),
     )
     sd = torch.load(str(weights_path), map_location="cpu")
+    # Old checkpoints (before round-skip) lack the beta parameter; fill with
+    # the same ReZero init so behaviour is identical to the pre-skip baseline.
+    if "beta" not in sd:
+        sd["beta"] = torch.tensor(1e-3)
     module.load_state_dict(sd, strict=True)
     module.to(device=device, dtype=dtype).eval()
     for p in module.parameters():

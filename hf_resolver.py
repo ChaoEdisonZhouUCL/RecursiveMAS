@@ -9,9 +9,12 @@ from huggingface_hub import snapshot_download
 
 
 def snapshot_repo(repo_id: str) -> Path:
+    import os
+    offline = os.environ.get("HF_HUB_OFFLINE", "0") not in ("0", "false", "False", "")
     resolved = snapshot_download(
         repo_id=repo_id,
         repo_type="model",
+        local_files_only=offline,
     )
     return Path(resolved).resolve()
 
