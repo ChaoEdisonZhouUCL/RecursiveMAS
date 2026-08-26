@@ -45,6 +45,7 @@ EVAL_SEED=42
 EVAL_LATENT_STEPS="48"          # latent steps for eval (empty = match LATENT_STEPS below; 0 = sweep 16/32/48; "protocol" = per-dataset value from eval_protocol.yaml)
 EVAL_N_ROUNDS="3"                # recursion rounds for eval (empty = match N_ROUNDS below)
 EVAL_GREEDY=false               # true = greedy decoding (reproducible; ignores temperature/top_p)
+EVAL_SELF_INJECT=false          # true = each agent re-reads its own previous-round latent thought
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
 N_ROUNDS=3

@@ -979,6 +979,72 @@ def run_outer_adapter(
     return out
 
 
+SELF_INJECT_LABEL = {
+    "planner": "\nYour plan from the previous round:",
+    "critic":  "\nYour critique from the previous round:",
+    "solver":  "\nYour solution from the previous round:",
+}
+
+
+class _SelfInjectState:
+    """Inference-only: each agent's own latent thought from the previous round,
+    re-spliced into that same agent's prompt this round (``--self_inject``).
+
+    The tensors are the agent's ``*_self`` latents, which already live in that
+    agent's own embedding space -- so feeding them back into the same agent
+    needs no projection and adds no parameters.  This is the ungated
+    counterpart of the recursive state z: information enters by occupying new
+    positions in the sequence rather than being scaled by gamma and summed.
+
+    Held as module state so the flag costs no signature churn across the five
+    latent stages.  Not used during training.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self._prev: Dict[str, List[torch.Tensor]] = {}
+        self._cur: Dict[str, List[torch.Tensor]] = {}
+
+    def get(self, role: str, idx: int):
+        if not self.enabled:
+            return None
+        seq = self._prev.get(role)
+        if not seq or idx >= len(seq):
+            return None
+        t = seq[idx]
+        return t if (t is not None and t.numel()) else None
+
+    def record(self, role: str, batch: torch.Tensor) -> None:
+        if not self.enabled:
+            return
+        cur = self._cur.setdefault(role, [])
+        for i in range(batch.size(0)):
+            cur.append(batch[i].detach().cpu())
+
+    def commit(self, role: str) -> None:
+        """Promote what this stage produced to be next round's injection."""
+        if not self.enabled:
+            return
+        self._prev[role] = self._cur.pop(role, [])
+
+    def reset(self) -> None:
+        self._prev.clear()
+        self._cur.clear()
+
+
+SELF_INJECT = _SelfInjectState()
+
+
+def self_inject_embeds(role, idx, tokenizer, embed_layer, device, dtype):
+    """Embeds for the labelled previous-round self block, or None if disabled."""
+    block = SELF_INJECT.get(role, idx)
+    if block is None:
+        return None
+    label_ids = tokenizer(SELF_INJECT_LABEL[role], add_special_tokens=False)["input_ids"]
+    label = token_ids_to_embeds(embed_layer, label_ids, device=device, dtype=dtype)
+    return torch.cat([label, block.to(device=device, dtype=dtype)], dim=0)
+
+
 @torch.no_grad()
 def autoregressive_latent_rollout(
     model,
@@ -1171,6 +1237,7 @@ def run_planner_latent_stage(
             latent_steps=latent_steps,
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
+        SELF_INJECT.record("planner", planner_self)
         if shared_link is not None:
             lat12 = shared_link(planner_self.to(device=shared_link.in_proj[1].weight.device),
                                 src=1, dst=2).to(planner_embed_dtype)
@@ -1180,6 +1247,7 @@ def run_planner_latent_stage(
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
 
+    SELF_INJECT.commit("planner")
     release_resources(model, tokenizer, inner_1, outer_12)
     return planner_to_refiner
 
@@ -1289,7 +1357,15 @@ def run_refiner_latent_stage(
                 dtype=refiner_embed_dtype,
             )
             planner_embed = planner_latents[idx].to(device=device, dtype=refiner_embed_dtype)
-            seq = torch.cat([prefix_embeds, planner_embed, suffix_embeds], dim=0)
+            _parts = [prefix_embeds, planner_embed]
+            # Ungated short path: this agent's own latent thought from the
+            # previous round, occupying new positions rather than being summed.
+            _inj = self_inject_embeds("critic", idx, tokenizer, embed_layer,
+                                      device=device, dtype=refiner_embed_dtype)
+            if _inj is not None:
+                _parts.append(_inj)
+            _parts.append(suffix_embeds)
+            seq = torch.cat(_parts, dim=0)
             embed_seqs.append(seq)
 
         batch_embeds, attention_mask = pad_left_embeds(embed_seqs, device=device)
@@ -1301,6 +1377,7 @@ def run_refiner_latent_stage(
             latent_steps=latent_steps,
         )
         refiner_self = run_inner_adapter(inner_2, hidden_rollout, output_dtype=refiner_embed_dtype)
+        SELF_INJECT.record("critic", refiner_self)
         if shared_link is not None:
             mapped = shared_link(refiner_self.to(device=shared_link.in_proj[1].weight.device),
                                  src=2, dst=3).to(refiner_embed_dtype)
@@ -1309,6 +1386,7 @@ def run_refiner_latent_stage(
         for i in range(mapped.size(0)):
             refiner_to_solver.append(mapped[i].detach().cpu())
 
+    SELF_INJECT.commit("critic")
     release_resources(model, tokenizer, inner_2, outer_23)
     return refiner_to_solver
 
@@ -1422,7 +1500,15 @@ def run_solver_feedback_latent_stage(
                 dtype=solver_embed_dtype,
             )
             refiner_embed = refiner_latents[idx].to(device=device, dtype=solver_embed_dtype)
-            seq = torch.cat([prefix_embeds, refiner_embed, suffix_embeds], dim=0)
+            _parts = [prefix_embeds, refiner_embed]
+            # Ungated short path: this agent's own latent thought from the
+            # previous round, occupying new positions rather than being summed.
+            _inj = self_inject_embeds("solver", idx, tokenizer, embed_layer,
+                                      device=device, dtype=solver_embed_dtype)
+            if _inj is not None:
+                _parts.append(_inj)
+            _parts.append(suffix_embeds)
+            seq = torch.cat(_parts, dim=0)
             embed_seqs.append(seq)
 
         batch_embeds, attention_mask = pad_left_embeds(embed_seqs, device=device)
@@ -1434,6 +1520,7 @@ def run_solver_feedback_latent_stage(
             latent_steps=latent_steps,
         )
         solver_self = run_inner_adapter(inner_3, hidden_rollout, output_dtype=solver_embed_dtype)
+        SELF_INJECT.record("solver", solver_self)
         if isinstance(shared_link, SharedRecursiveStateLink):
             # shared_state: residual recursive state bypasses the full round.
             _dev = shared_link.in_proj[1].weight.device
@@ -1459,6 +1546,7 @@ def run_solver_feedback_latent_stage(
 
     if round_state_io is not None and "_new_states" in round_state_io:
         round_state_io["states"] = round_state_io.pop("_new_states")
+    SELF_INJECT.commit("solver")
     release_resources(model, tokenizer, inner_3, outer_31)
     return feedback_latents
 
@@ -1568,7 +1656,15 @@ def run_planner_feedback_latent_stage(
                 dtype=planner_embed_dtype,
             )
             feedback_embed = feedback_latents[idx].to(device=device, dtype=planner_embed_dtype)
-            seq = torch.cat([prefix_embeds, feedback_embed, suffix_embeds], dim=0)
+            _parts = [prefix_embeds, feedback_embed]
+            # Ungated short path: this agent's own latent thought from the
+            # previous round, occupying new positions rather than being summed.
+            _inj = self_inject_embeds("planner", idx, tokenizer, embed_layer,
+                                      device=device, dtype=planner_embed_dtype)
+            if _inj is not None:
+                _parts.append(_inj)
+            _parts.append(suffix_embeds)
+            seq = torch.cat(_parts, dim=0)
             embed_seqs.append(seq)
 
         batch_embeds, attention_mask = pad_left_embeds(embed_seqs, device=device)
@@ -1580,6 +1676,7 @@ def run_planner_feedback_latent_stage(
             latent_steps=latent_steps,
         )
         planner_self = run_inner_adapter(inner_1, hidden_rollout, output_dtype=planner_embed_dtype)
+        SELF_INJECT.record("planner", planner_self)
         if shared_link is not None:
             lat12 = shared_link(planner_self.to(device=shared_link.in_proj[1].weight.device),
                                 src=1, dst=2).to(planner_embed_dtype)
@@ -1588,6 +1685,7 @@ def run_planner_feedback_latent_stage(
         for i in range(lat12.size(0)):
             planner_to_refiner.append(lat12[i].detach().cpu())
 
+    SELF_INJECT.commit("planner")
     release_resources(model, tokenizer, inner_1, outer_12)
     return planner_to_refiner
 
@@ -1679,14 +1777,13 @@ def run_solver_latent_stage(
                 dtype=embed_dtype,
             )
             refiner_embed = refiner_latents[idx].to(device=device, dtype=embed_dtype)
-            seq = torch.cat(
-                [
-                    prefix_embeds,
-                    refiner_embed,
-                    suffix_embeds,
-                ],
-                dim=0,
-            )
+            _parts = [prefix_embeds, refiner_embed]
+            _inj = self_inject_embeds("solver", idx, tokenizer, embed_layer,
+                                      device=device, dtype=embed_dtype)
+            if _inj is not None:
+                _parts.append(_inj)
+            _parts.append(suffix_embeds)
+            seq = torch.cat(_parts, dim=0)
             embed_seqs.append(seq)
 
         batch_embeds, attention_mask = pad_left_embeds(embed_seqs, device=device)
@@ -1848,6 +1945,17 @@ def parse_args() -> argparse.Namespace:
             "Base sampling seed for rollout generation. "
             "If < 0, uses --seed. Rollout r uses (base + r)."
         ),
+    )
+    parser.add_argument(
+        "--self_inject",
+        action="store_true",
+        default=False,
+        help="Splice each agent's own latent thought from the previous round back "
+             "into its prompt this round, behind a short text label. The latents "
+             "already live in that agent's embedding space, so this adds no "
+             "parameters. Ungated short path: unlike the recursive state z, "
+             "information enters by occupying new sequence positions instead of "
+             "being scaled by gamma and summed. Inference-only diagnostic.",
     )
     parser.add_argument(
         "--num_rollouts",
@@ -2020,6 +2128,9 @@ def main() -> None:
         raise ValueError(f"Unsupported --mas_shape: {args.mas_shape}")
     if args.max_new_tokens <= 0:
         raise ValueError("--max_new_tokens must be positive.")
+    SELF_INJECT.enabled = bool(getattr(args, "self_inject", False))
+    if SELF_INJECT.enabled:
+        print("[self_inject] ON - each agent re-reads its own previous-round latents")
     if args.num_rollouts <= 0:
         raise ValueError("--num_rollouts must be positive.")
     if args.num_recursive_rounds <= 0:
@@ -2611,6 +2722,9 @@ def main() -> None:
         solver_round_state_io: Optional[Dict[str, Any]] = (
             {"states": None} if isinstance(shared_link, SharedRecursiveStateLink) else None
         )
+        # Fresh recursion pass: drop any self-inject latents left over from a
+        # previous rollout, or round 0 would splice in another pass's thoughts.
+        SELF_INJECT.reset()
         for round_idx in range(recursive_rounds):
             if round_idx == 0:
                 planner_to_refiner = run_planner_latent_stage(

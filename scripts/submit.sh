@@ -139,6 +139,7 @@ while [[ $# -gt 0 ]]; do
         --eval_latent_steps)  EVAL_LATENT_STEPS="$2";  shift 2 ;;
         --eval_n_rounds)      EVAL_N_ROUNDS="$2";      shift 2 ;;
         --eval_greedy)        EVAL_GREEDY=true;        shift ;;
+        --eval_self_inject)   EVAL_SELF_INJECT=true;   shift ;;
         --n_rounds)           N_ROUNDS="$2";           shift 2 ;;
         --latent_steps)       LATENT_STEPS="$2";       shift 2 ;;
         --batch_size)         BATCH_SIZE="$2";         shift 2 ;;
@@ -264,11 +265,22 @@ if [[ "${EVAL}" == "true" ]]; then
     --num_recursive_rounds ${EVAL_N_ROUNDS} \
     --trust_remote_code 1 --device cuda"
         [[ "${EVAL_GREEDY}" == "true" ]] && TRAIN_CMD="${TRAIN_CMD} --greedy"
+        # Self-inject runs get their own result file, so an A/B on the same
+        # checkpoint+dataset does not overwrite its own control.
+        local _si_tag=""
+        if [[ "${EVAL_SELF_INJECT}" == "true" ]]; then
+            TRAIN_CMD="${TRAIN_CMD} --self_inject"
+            _si_tag="_selfinject"
+        fi
+        # Only non-default seed/rounds extend the name, so existing result files
+        # keep the name sync_eval_to_wandb.py already expects.
+        [[ "${EVAL_SEED}" != "42" ]]     && _si_tag="${_si_tag}_s${EVAL_SEED}"
+        [[ "${EVAL_N_ROUNDS}" != "3" ]]  && _si_tag="${_si_tag}_r${EVAL_N_ROUNDS}"
         # Compute nodes have no internet, so eval writes its metric next to the
         # checkpoint; sync_eval_to_wandb.py attaches it to the training W&B run
         # from the login node afterwards.
         if [[ "${ckpt}" != "released_weights" ]]; then
-            TRAIN_CMD="${TRAIN_CMD} --result_json ${ckpt}/eval_${ds}.json"
+            TRAIN_CMD="${TRAIN_CMD} --result_json ${ckpt}/eval_${ds}${_si_tag}.json"
         fi
         return 0
     }

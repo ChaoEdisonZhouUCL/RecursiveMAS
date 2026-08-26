@@ -73,6 +73,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--max_new_tokens", type=int, default=-1,
         help="Max new tokens. -1 = from eval_protocol.yaml, else per-dataset built-in.",
     )
+    p.add_argument(
+        "--self_inject", action="store_true", default=False,
+        help="Each agent re-reads its own latent thought from the previous round, "
+             "spliced into its prompt behind a short text label. Parameter-free "
+             "(same agent, same embedding space) and ungated, unlike the recursive "
+             "state z. Use to test whether the rounds carry anything at all.",
+    )
     p.add_argument("--trust_remote_code", type=int, default=1, choices=[0, 1])
     p.add_argument("--device", default=None)
     p.add_argument(
@@ -336,6 +343,8 @@ def build_common_cli(args: argparse.Namespace, dataset_arg: str, dataset_split: 
         out.extend(["--device", str(args.device)])
     if not args.greedy:
         out.append("--do_sample")
+    if getattr(args, "self_inject", False):
+        out.append("--self_inject")
     out.append("--ans")
     return out
 
