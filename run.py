@@ -520,6 +520,7 @@ def main() -> int:
             "n_rounds": args.num_recursive_rounds,
             "batch_size": args.batch_size,
             "seed": args.seed,
+            "self_inject": bool(getattr(args, "self_inject", False)),
             "greedy": bool(args.greedy),
             "num_rollouts": num_rollouts,
             "max_new_tokens": max_new_tokens,
