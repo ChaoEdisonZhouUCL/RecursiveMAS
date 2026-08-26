@@ -1879,11 +1879,6 @@ def run_training(cfg, device: torch.device, mode: str = "original",
 
     for step in range(start_step, cfg.steps):
 
-        # Drop last step's forward-write trace so what we log always belongs to
-        # this step (see SharedRecursiveStateLink.write_log).
-        if isinstance(shared_link, SharedRecursiveStateLink):
-            shared_link.write_log.clear()
-
         if optimizer is not None:
             # set_to_none=False: the all-reduce below flattens a fixed parameter
             # list, so the .grad buffers must stay allocated (and zeroed) even for
@@ -1894,6 +1889,12 @@ def run_training(cfg, device: torch.device, mode: str = "original",
         _accum_loss_scalars: List[float] = []
 
         for _accum in range(grad_accum):
+
+            # Reset the forward-write trace per MICRO-BATCH, not per step: with
+            # grad_accum > 1 the rounds of every micro-batch land in the same list,
+            # and slicing the tail would mislabel which round each entry came from.
+            if isinstance(shared_link, SharedRecursiveStateLink):
+                shared_link.write_log.clear()
 
             # ── Sample a micro-batch of B problems ───────────────────────────
             idxs      = rng.integers(len(problems), size=B)
