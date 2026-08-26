@@ -404,6 +404,13 @@ class SharedRecursiveStateLink(SharedRecursiveLink):
                          n_experts=n_experts, expert_dim_divisor=expert_dim_divisor)
         # Round-bypass gate: near-identity round-to-round Jacobian at init.
         self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        # Populated by round_feedback(); diagnostics only, not part of the graph.
+        self.last_f_norm = float("nan")
+        self.last_state_norm = float("nan")
+        self.last_write_ratio = float("nan")
+        # One (|f|, |z|, write_ratio) triple per round_feedback() call, in round
+        # order.  The training loop drains it each logging step.
+        self.write_log: List[Tuple[float, float, float]] = []
 
     def round_feedback(
         self,
@@ -432,7 +439,24 @@ class SharedRecursiveStateLink(SharedRecursiveLink):
         in_dtype = solver_h.dtype
         p_dtype = _module_param_dtype(self)
         f = self._latent_core(solver_h.to(p_dtype), src=3, dst=1)
+        # Diagnostic (no autograd effect): how much this round actually writes into
+        # the state.  gamma gates every round after the first, so `write_ratio` is
+        # the forward-pass counterpart of the per-round gradient profile -- if it is
+        # ~1e-3 then the state is still, to three significant figures, round 1's.
+        with torch.no_grad():
+            prev_norm = None if state is None else float(state.to(p_dtype).norm())
+            self.last_f_norm = float(f.norm())
         state = f if state is None else state.to(p_dtype) + self.gamma * f
+        with torch.no_grad():
+            self.last_state_norm = float(state.norm())
+            self.last_write_ratio = (
+                float("nan") if prev_norm is None
+                else float((self.gamma * f).norm()) / max(prev_norm, 1e-30)
+            )
+            if len(self.write_log) < 64:   # bounded; drained by the training loop
+                self.write_log.append(
+                    (self.last_f_norm, self.last_state_norm, self.last_write_ratio)
+                )
         return self._project_out(state, 1).to(in_dtype), state
 
 

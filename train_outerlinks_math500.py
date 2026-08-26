@@ -1613,12 +1613,16 @@ def run_training(cfg, device: torch.device, mode: str = "original",
         hidden_dims = [PLANNER_DIM, CRITIC_DIM, SOLVER_DIM]
         shared_dim  = 1024
         link_cls = SHARED_LINK_CLS[mode]
-        shared_link = link_cls(
+        link_kwargs = dict(
             hidden_dims=hidden_dims,
             shared_dim=shared_dim,
             n_experts=getattr(cfg, "n_experts", 4),
             expert_dim_divisor=getattr(cfg, "expert_dim_divisor", 4),
-        ).to(device=device, dtype=link_dtype).train()
+        )
+        # gamma is the recursive-state write gate; only SharedRecursiveStateLink has it.
+        if issubclass(link_cls, SharedRecursiveStateLink):
+            link_kwargs["gamma_init"] = getattr(cfg, "gamma_init", 1e-3)
+        shared_link = link_cls(**link_kwargs).to(device=device, dtype=link_dtype).train()
         if not use_round_skip:
             # Ablation: freeze beta=0 so round-skip is disabled throughout training.
             shared_link.beta.data.zero_()
@@ -1874,6 +1878,11 @@ def run_training(cfg, device: torch.device, mode: str = "original",
         print(f"[wandb] run {_wandb_meta['id']} → {_run_dir / 'wandb_run.json'}")
 
     for step in range(start_step, cfg.steps):
+
+        # Drop last step's forward-write trace so what we log always belongs to
+        # this step (see SharedRecursiveStateLink.write_log).
+        if isinstance(shared_link, SharedRecursiveStateLink):
+            shared_link.write_log.clear()
 
         if optimizer is not None:
             # set_to_none=False: the all-reduce below flattens a fixed parameter
@@ -2177,6 +2186,15 @@ def run_training(cfg, device: torch.device, mode: str = "original",
 
                 if use_wandb and wb_gates:
                     wandb.log(wb_gates, step=step)
+
+            # The recursive state lives on the solver rank, so the forward-write
+            # diagnostic has to be printed from there.  write_ratio is
+            # ||gamma*f^(r)|| / ||z^(r-1)||: the fraction by which round r moves the
+            # state.  NaN on round 1, which seeds the state rather than writing to it.
+            if rank == rs and isinstance(shared_link, SharedRecursiveStateLink):
+                for i, (fn, zn, wr) in enumerate(shared_link.write_log[-cfg.n_rounds:]):
+                    print(f"           write[r{i+1}] |f|={fn:.3e}  |z|={zn:.3e}"
+                          f"  write_ratio={wr:.3e}", flush=True)
 
         # ── Mid-training checkpoint ───────────────────────────────────────────
         is_last_step = (step == cfg.steps - 1)
@@ -2850,6 +2868,14 @@ def parse_args():
                    help="Number of MoE experts (shared_roae mode only).")
     p.add_argument("--expert_dim_divisor", type=int, default=4,
                    help="Expert inner dim = shared_dim // expert_dim_divisor.")
+    p.add_argument("--gamma_init", type=float, default=1e-3,
+                   help="Initial value of the recursive-state write gate gamma "
+                        "(shared_state mode only).  z' = z + gamma*f, so gamma is the "
+                        "input gate: round 1 seeds the state with weight 1 and every "
+                        "later round enters with weight gamma, which is why the "
+                        "per-stage round1/round2 gradient ratio equals 1/gamma.  The "
+                        "ReZero default (1e-3) admits later rounds at 0.1% strength in "
+                        "the forward pass as well as the backward one.")
     p.add_argument("--no_round_skip", action="store_true", default=False,
                    help="Disable the round-skip gate (beta=0, frozen) in shared_roae mode.")
     p.add_argument("--n_ckpt", type=int, default=1,

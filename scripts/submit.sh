@@ -68,6 +68,7 @@ Training options:
                             (semi-orthogonal round trips at init)
   --n_experts N           MoE experts (shared_roae/compare only)  (default: 4)
   --expert_dim_divisor N  Expert inner dim divisor                (default: 4)
+  --gamma_init F          Initial recursive-state write gate      (default: 1e-3)
   --no_kv_cache           Disable KV cache in latent rollout      (required for latent_steps>=20)
   --no_round_skip         Disable round-skip gate (beta=0, frozen); shared_roae mode only
   --dataset NAME          math500 | s1k | m1k | s1k+m1k (pooled)  (default: math500)
@@ -148,6 +149,7 @@ while [[ $# -gt 0 ]]; do
         --mode)               MODE="$2";               shift 2 ;;
         --n_experts)          N_EXPERTS="$2";          shift 2 ;;
         --expert_dim_divisor) EXPERT_DIM_DIVISOR="$2"; shift 2 ;;
+        --gamma_init)         GAMMA_INIT="$2";         shift 2 ;;
         --no_kv_cache)        NO_KV_CACHE=true;        shift ;;
         --no_round_skip)      USE_ROUND_SKIP=false;    shift ;;
         --n_ckpt)             N_CKPT="$2";             shift 2 ;;
@@ -292,6 +294,7 @@ else
     --mode ${MODE} \
     --n_experts ${N_EXPERTS} \
     --expert_dim_divisor ${EXPERT_DIM_DIVISOR} \
+    --gamma_init ${GAMMA_INIT} \
     --dataset ${DATASET} \
     --max_seq_len ${MAX_SEQ_LEN} \
     --n_samples ${N_SAMPLES} \

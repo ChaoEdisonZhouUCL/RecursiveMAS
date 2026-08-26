@@ -67,6 +67,10 @@ MODE="shared_roae"        # original | shared_roae | shared_state | shared_tied 
 USE_ROUND_SKIP=false             # true | false — set false to freeze beta=0 (ablation; shared_roae only)
 N_EXPERTS=3
 EXPERT_DIM_DIVISOR=3
+# Initial recursive-state write gate (shared_state only).  z' = z + GAMMA_INIT*f,
+# so this sets how strongly rounds after the first write into the state -- and
+# the per-stage round1/round2 gradient ratio is 1/GAMMA_INIT.
+GAMMA_INIT="1e-3"
 NO_KV_CACHE=false          # set true when latent_steps >= 20 (paper uses 80)
 DATASET="s1k+m1k+opencodereasoning+arpo_sft"          # math500 | s1k | m1k | opencodereasoning | arpo_sft | s1k+m1k+opencodereasoning+arpo_sft (pooled)
 MAX_SEQ_LEN=4096              # max combined question+answer length in tokens (0 = no truncation)
