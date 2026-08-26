@@ -1,0 +1,62 @@
+# eval_protocol.yaml — per-dataset evaluation settings from the RecursiveMAS
+# paper (arXiv:2604.25917, experimental setup). Loaded by run.py at eval time.
+#
+# Precedence (highest first):
+#   1. explicit CLI flags passed to run.py (submit.sh passes some — see
+#      EVAL_PROTOCOL.md for which)
+#   2. this file (entry matching --dataset)
+#   3. run.py built-in defaults
+#
+# Recognized keys per dataset: temperature, top_p, max_new_tokens,
+# latent_length, num_rollouts, greedy. Extra keys (metric, notes) are
+# documentation only and ignored by run.py.
+
+defaults:
+  top_p: 0.95
+  greedy: false          # paper samples; greedy is a local reproducibility tool
+
+datasets:
+  math500:
+    temperature: 0.6
+    max_new_tokens: 2000
+    latent_length: 80
+    num_rollouts: 1
+    metric: accuracy
+  medqa:
+    temperature: 0.6
+    max_new_tokens: 4000
+    latent_length: 80
+    num_rollouts: 1
+    metric: accuracy (4-option multiple choice)
+  gpqa:
+    temperature: 0.6
+    max_new_tokens: 4000
+    latent_length: 80
+    num_rollouts: 1
+    metric: accuracy (4-option multiple choice)
+  aime2025:
+    temperature: 0.6
+    max_new_tokens: 16000
+    latent_length: 80
+    num_rollouts: 10
+    metric: pass@10
+    notes: greedy must be off for pass@10 (identical rollouts otherwise)
+  aime2026:
+    temperature: 0.6
+    max_new_tokens: 16000
+    latent_length: 80
+    num_rollouts: 10
+    metric: pass@10
+    notes: greedy must be off for pass@10 (identical rollouts otherwise)
+  mbppplus:
+    temperature: 0.2
+    max_new_tokens: 4000
+    latent_length: 80
+    num_rollouts: 1
+    metric: execution pass rate (public+private tests)
+  livecodebench:
+    temperature: 0.2
+    max_new_tokens: 4000
+    latent_length: 80
+    num_rollouts: 1
+    metric: execution pass rate (public+private tests)

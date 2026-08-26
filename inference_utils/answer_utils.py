@@ -21,6 +21,8 @@ _GPQA_KEYS = {
     "idavidrein/gpqa:gpqa_diamond",
     "idavidrein/gpqa_diamond",
 }
+_AIME2025_KEYS = {"aime2025", "aime25", "math-ai/aime25"}
+_AIME2026_KEYS = {"aime2026", "aime26", "math-ai/aime26"}
 
 def _dataset_key(name: str) -> str:
     return name.strip().lower()
@@ -51,6 +53,19 @@ def _is_math500_dataset(name: str) -> bool:
 
 def is_medqa_dataset(name: str) -> bool:
     return _dataset_key(name) in _MEDQA_KEYS
+
+
+def is_aime2025_dataset(name: str) -> bool:
+    return _dataset_key(name) in _AIME2025_KEYS
+
+
+def is_aime2026_dataset(name: str) -> bool:
+    return _dataset_key(name) in _AIME2026_KEYS
+
+
+def is_aime_dataset(name: str) -> bool:
+    key = _dataset_key(name)
+    return key in _AIME2025_KEYS or key in _AIME2026_KEYS
 
 
 def is_gpqa_dataset(name: str) -> bool:
@@ -420,7 +435,7 @@ def compare_answers(
             f"choice:{pred_choice.lower()}",
         )
 
-    if _is_math500_dataset(dataset_name):
+    if _is_math500_dataset(dataset_name) or is_aime_dataset(dataset_name):
         pred_answer = extract_pred_answer(pred_text)
         if pred_answer is None:
             return gold_answer, None, False, "", ""

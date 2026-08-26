@@ -3,6 +3,7 @@
 import argparse
 from collections.abc import Mapping
 import gc
+import glob
 import json
 import hashlib
 import importlib.util
@@ -36,6 +37,8 @@ from .answer_utils import (
     extract_boxed_answer,
     extract_choice_answer,
     format_latent_info,
+    is_aime2025_dataset,
+    is_aime2026_dataset,
     is_gemma_model_name,
     is_choice_dataset,
     is_gpqa_dataset,
@@ -65,22 +68,29 @@ from prompts import (
 )
 from .lcb_utils import (
     build_code_reparse_suffix,
+    build_lcb_sample_meta,
     build_mbppplus_sample_meta,
     clean_raw_output,
     evaluate_generated_code,
     extract_python_code,
     is_code_eval_dataset,
+    is_lcb_dataset,
     is_mbppplus_dataset,
     load_mbppplus_records,
+    load_release_v6_records,
 )
 
 from modeling import (
     Adapter,
     CrossModelAdapter,
     SharedRecursiveLink,
+    SharedRecursiveStateLink,
+    SharedRecursiveTiedLink,
     infer_inner_adapter_type_from_state_dict,
     infer_outer_adapter_type_from_state_dict,
     load_shared_recursive_link,
+    load_shared_recursive_state_link,
+    load_shared_recursive_tied_link,
     normalize_inner_adapter_type,
     normalize_outer_adapter_type,
     resolve_local_pretrained_path,
@@ -134,12 +144,18 @@ def resolve_dataset(name: str) -> Tuple[str, Optional[str]]:
         return "openai/gsm8k", "main"
     if key in {"math500", "math-500", "huggingfaceh4/math-500"}:
         return "HuggingFaceH4/MATH-500", None
+    if is_aime2025_dataset(key):
+        return "math-ai/aime25", None
+    if is_aime2026_dataset(key):
+        return "math-ai/aime26", None
     if is_medqa_dataset(key):
         return "__local_medqa__", None
     if is_gpqa_dataset(key):
         return "Idavidrein/gpqa", "gpqa_diamond"
     if is_mbppplus_dataset(key):
         return "__mbppplus__", None
+    if is_lcb_dataset(key):
+        return "__lcb__", None
     return name, None
 
 
@@ -203,6 +219,87 @@ def _load_medqa_records(path: str) -> List[Mapping]:
     return [x for x in data if isinstance(x, Mapping)]
 
 
+def _find_cached_arrow_snapshot(dataset_name: str, dataset_config: Optional[str]) -> Optional[str]:
+    """Locate a datasets-library cache snapshot dir for dataset_name on disk.
+
+    Mirrors datasets.load.CachedDatasetModuleFactory's own path layout
+    (<cache>/<namespace>___<name>/<config>/<version>/<hash>/) so we can load
+    straight from the cached Arrow files, bypassing dataset_module_factory's
+    Hub-first lookup entirely. Returns the newest matching snapshot dir, or
+    None if nothing is cached.
+    """
+    from datasets.naming import camelcase_to_snakecase
+
+    cache_root = os.environ.get("HF_DATASETS_CACHE") or os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "datasets"
+    )
+    namespace_and_name = dataset_name.split("/")
+    namespace_and_name[-1] = camelcase_to_snakecase(namespace_and_name[-1])
+    cached_relative = "___".join(namespace_and_name)
+    dataset_root = os.path.join(cache_root, cached_relative)
+    config_glob = dataset_config or "*"
+    pattern = os.path.join(dataset_root, config_glob, "*", "*")
+    candidates = [p for p in glob.glob(pattern) if os.path.isdir(p)]
+    if not candidates:
+        # Diagnostics: this path has been silently returning None on some
+        # compute nodes for reasons not yet reproduced off-node. Report
+        # exactly what this process saw so the next failing job's log
+        # pinpoints whether it's a missing HF_HOME, a GPFS visibility gap,
+        # or something else entirely.
+        print(f"[debug] _find_cached_arrow_snapshot({dataset_name!r}, {dataset_config!r}): "
+              f"HF_HOME={os.environ.get('HF_HOME')!r} HF_DATASETS_CACHE={os.environ.get('HF_DATASETS_CACHE')!r} "
+              f"cache_root={cache_root!r} dataset_root={dataset_root!r} "
+              f"dataset_root_exists={os.path.isdir(dataset_root)} pattern={pattern!r}")
+        if os.path.isdir(dataset_root):
+            print(f"[debug]   dataset_root contents: {os.listdir(dataset_root)}")
+        elif os.path.isdir(cache_root):
+            print(f"[debug]   cache_root exists; sample contents: {os.listdir(cache_root)[:10]}")
+        else:
+            print(f"[debug]   cache_root does not exist either.")
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def _load_dataset_offline_first(dataset_name: str, dataset_config, split: str):
+    """Load a HF dataset, checking the local HF_HOME cache before anything else.
+
+    datasets.load_dataset (even under HF_HUB_OFFLINE) tries a Hub metadata
+    lookup first, catches the resulting OfflineModeIsEnabled/ConnectionError,
+    and only *then* falls back to scanning the cache directory. On a shared
+    network filesystem (GPFS) a freshly scheduled compute node can transiently
+    fail that fallback scan even though the snapshot is present and visible
+    from other nodes/processes, raising ConnectionError straight through.
+
+    To avoid depending on that fallback at all, this resolves the cached
+    snapshot under HF_HOME ourselves first and loads it directly via the
+    packaged "arrow" reader (bypassing dataset_module_factory's Hub-lookup
+    path entirely). Only if nothing is cached locally does it fall through to
+    the normal load_dataset call, with a short retry/backoff for the same
+    transient-lag failure mode.
+    """
+    snapshot_dir = _find_cached_arrow_snapshot(dataset_name, dataset_config)
+    if snapshot_dir is not None:
+        try:
+            return load_dataset("arrow", data_dir=snapshot_dir, split=split)
+        except Exception as e:
+            print(f"[warn] direct cache load of {dataset_name!r} from {snapshot_dir} failed "
+                  f"({e}); falling back to load_dataset(...).")
+
+    retries = 5
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            return load_dataset(dataset_name, dataset_config, split=split)
+        except ConnectionError as e:
+            last_exc = e
+            if attempt < retries - 1:
+                delay = 2.0 * (attempt + 1)
+                print(f"[warn] load_dataset({dataset_name!r}) failed (attempt {attempt + 1}/{retries}): "
+                      f"{e}. Retrying in {delay:.0f}s (likely transient GPFS cache-metadata lag).")
+                time.sleep(delay)
+    raise last_exc
+
+
 def load_eval_questions_and_answers(
     dataset: str,
     dataset_split: str,
@@ -254,6 +351,35 @@ def load_eval_questions_and_answers(
             return "mbppplus", questions, gold_answers, sample_metadata
         return "mbppplus", questions, gold_answers
 
+    if dataset_name == "__lcb__":
+        # LiveCodeBench release_v6; the split argument is ignored (the release
+        # files are the test set).
+        records = load_release_v6_records()
+        if len(records) == 0:
+            raise ValueError("Loaded LiveCodeBench records are empty.")
+
+        if shuffle:
+            rng = random.Random(seed)
+            rng.shuffle(records)
+        if num_samples > 0:
+            records = records[: min(num_samples, len(records))]
+
+        questions = []
+        gold_answers = []
+        sample_metadata = []
+        for row in records:
+            meta = build_lcb_sample_meta(
+                row,
+                use_private_tests=bool(lcb_use_private_tests),
+            )
+            questions.append(str(meta["question"]))
+            gold_answers.append(str(meta.get("gold_answer", "")))
+            sample_metadata.append(meta)
+
+        if return_metadata:
+            return "livecodebench", questions, gold_answers, sample_metadata
+        return "livecodebench", questions, gold_answers
+
     if dataset_name == "__local_medqa__":
         medqa_path = dataset
         if not os.path.isfile(medqa_path):
@@ -289,7 +415,7 @@ def load_eval_questions_and_answers(
             return "medqa", questions, gold_answers, None
         return "medqa", questions, gold_answers
 
-    ds = load_dataset(dataset_name, dataset_config, split=dataset_split)
+    ds = _load_dataset_offline_first(dataset_name, dataset_config, dataset_split)
     if len(ds) == 0:
         raise ValueError("Loaded dataset is empty.")
     if shuffle:
@@ -1206,6 +1332,7 @@ def run_solver_feedback_latent_stage(
     task_types: Optional[Sequence[str]] = None,
     fn_names: Optional[Sequence[Optional[str]]] = None,
     shared_link: Optional["SharedRecursiveLink"] = None,
+    round_state_io: Optional[Dict[str, Any]] = None,   # shared_state: {"states": per-sample z list or None}
 ) -> List[torch.Tensor]:
     if latent_steps == 0:
         out_dim = (shared_link.hidden_dims[0] if shared_link is not None
@@ -1307,7 +1434,22 @@ def run_solver_feedback_latent_stage(
             latent_steps=latent_steps,
         )
         solver_self = run_inner_adapter(inner_3, hidden_rollout, output_dtype=solver_embed_dtype)
-        if shared_link is not None:
+        if isinstance(shared_link, SharedRecursiveStateLink):
+            # shared_state: residual recursive state bypasses the full round.
+            _dev = shared_link.in_proj[1].weight.device
+            h = solver_self.to(device=_dev)
+            prev = None
+            if round_state_io is not None and round_state_io.get("states") is not None:
+                prev = torch.stack(
+                    [round_state_io["states"][i] for i in range(start, end)]
+                ).to(device=_dev, dtype=h.dtype)
+            mapped_feedback, new_state = shared_link.round_feedback(h, prev)
+            mapped_feedback = mapped_feedback.to(torch.float32)
+            if round_state_io is not None:
+                round_state_io.setdefault("_new_states", []).extend(
+                    new_state[i].detach().cpu() for i in range(new_state.size(0))
+                )
+        elif shared_link is not None:
             mapped_feedback = shared_link(solver_self.to(device=shared_link.in_proj[1].weight.device),
                                           src=3, dst=1).to(torch.float32)
         else:
@@ -1315,6 +1457,8 @@ def run_solver_feedback_latent_stage(
         for i in range(mapped_feedback.size(0)):
             feedback_latents.append(mapped_feedback[i].detach().cpu())
 
+    if round_state_io is not None and "_new_states" in round_state_io:
+        round_state_io["states"] = round_state_io.pop("_new_states")
     release_resources(model, tokenizer, inner_3, outer_31)
     return feedback_latents
 
@@ -1935,12 +2079,23 @@ def main() -> None:
     shared_link: Optional[SharedRecursiveLink] = None
     if getattr(args, "shared_link_path", None):
         from pathlib import Path as _Path
-        shared_link = load_shared_recursive_link(
-            ckpt_dir=_Path(args.shared_link_path),
+        _link_dir = _Path(args.shared_link_path)
+        # The checkpoint's config records which shared-link variant was trained.
+        _adapter_type = "shared_recursive_link"
+        _cfg_path = _link_dir / "shared_roae_config.json"
+        if _cfg_path.is_file():
+            with open(_cfg_path) as _f:
+                _adapter_type = json.load(_f).get("adapter_type", _adapter_type)
+        _loader = {
+            "shared_recursive_state_link": load_shared_recursive_state_link,
+            "shared_recursive_tied_link": load_shared_recursive_tied_link,
+        }.get(_adapter_type, load_shared_recursive_link)
+        shared_link = _loader(
+            ckpt_dir=_link_dir,
             device=device,
             dtype=outer_dtype if not isinstance(outer_dtype, str) else torch.bfloat16,
         )
-        print(f"[shared_roae] Loaded SharedRecursiveLink from {args.shared_link_path}")
+        print(f"[shared_roae] Loaded {type(shared_link).__name__} from {args.shared_link_path}")
         # Sentinel paths — not used when shared_link is active but must satisfy resolver.
         outer_12_path = outer_23_path = outer_31_path = "__shared_link__"
     else:
@@ -2452,6 +2607,10 @@ def main() -> None:
         feedback_to_planner_rounds: List[List[torch.Tensor]] = []
 
         feedback_to_planner: Optional[List[torch.Tensor]] = None
+        # shared_state: per-sample recursive state z carried across rounds.
+        solver_round_state_io: Optional[Dict[str, Any]] = (
+            {"states": None} if isinstance(shared_link, SharedRecursiveStateLink) else None
+        )
         for round_idx in range(recursive_rounds):
             if round_idx == 0:
                 planner_to_refiner = run_planner_latent_stage(
@@ -2537,6 +2696,7 @@ def main() -> None:
                     task_types=task_types,
                     fn_names=fn_names,
                     shared_link=shared_link,
+                    round_state_io=solver_round_state_io,
                 )
                 feedback_to_planner = [x for x in feedback_to_planner]
                 feedback_to_planner_rounds.append(feedback_to_planner)

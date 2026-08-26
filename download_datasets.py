@@ -1,6 +1,7 @@
 """
-Download s1K, m1K, OpenCodeReasoning, and ARPO-SFT datasets into data/raw/,
-and/or predownload MAS model repos into a shared HF cache.
+Download s1K, m1K, OpenCodeReasoning, ARPO-SFT, MATH-500, MedQA, AIME2025,
+and AIME2026 datasets into data/raw/, and/or predownload MAS model repos
+into a shared HF cache.
 
 Usage:
     # datasets only (default)
@@ -14,7 +15,7 @@ Usage:
 
 Each dataset is fetched via huggingface_hub.snapshot_download (repo_type="dataset")
 and stored in its own subdirectory under --out-dir, named after the dataset key
-(s1k, m1k, opencodereasoning, arpo_sft).
+(s1k, m1k, opencodereasoning, arpo_sft, math500, medqa, aime2025, aime2026).
 
 Each model is fetched via huggingface_hub.snapshot_download (repo_type="model")
 into --hf-cache-dir, which is also exported as HF_HOME/HF_HUB_CACHE so that
@@ -31,13 +32,18 @@ import os
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
-os.environ["HF_TOKEN"] = "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"  # avoid HF trying to access the network during model loading
+
 DATASET_REPOS = {
     "s1k":              "simplescaling/s1K",
     "m1k":              "UCSC-VLAA/m1k-tokenized",
     "opencodereasoning": "nvidia/OpenCodeReasoning",
     "arpo_sft":         "dongguanting/ARPO-SFT-54K",
     "math500":          "HuggingFaceH4/MATH-500",
+    # NOTE: run.py --dataset medqa reads the local dataset/medqa.json shipped
+    # with the repo; this HF copy is a predownload for offline reference.
+    "medqa":            "GBaker/MedQA-USMLE-4-options",
+    "aime2025":         "math-ai/aime25",
+    "aime2026":         "math-ai/aime26",
 }
 
 # Model repos per MAS "style", mirroring STYLE_SPECS in load_from_repo.py.
@@ -74,6 +80,72 @@ MODEL_STYLE_REPOS = {
 }
 
 
+# Eval datasets are loaded at runtime straight from the shared HF cache
+# (HF_HOME=/p/project1/hai_1354/hf_cache, HF_HUB_OFFLINE=1), not from data/raw.
+# Each entry mirrors the exact call made by inference_utils at eval time so the
+# cache layout matches what the offline job will look for.
+EVAL_DATASETS = ("gpqa", "mbppplus", "livecodebench", "math500", "aime2025", "aime2026")
+
+# Datasets loaded at eval time via a plain load_dataset(repo, split=...).
+EVAL_LOAD_DATASET_REPOS = {
+    "math500":  ("HuggingFaceH4/MATH-500", "test"),
+    "aime2025": ("math-ai/aime25", "test"),
+    "aime2026": ("math-ai/aime26", "test"),
+}
+
+LCB_REPO = "livecodebench/code_generation_lite"
+LCB_RELEASE_V6_FILES = [
+    "test.jsonl",
+    "test2.jsonl",
+    "test3.jsonl",
+    "test4.jsonl",
+    "test5.jsonl",
+    "test6.jsonl",
+]
+
+
+def download_eval_dataset(name: str, cache_dir: Path, token: str = "") -> None:
+    from datasets import load_dataset
+
+    from huggingface_hub import hf_hub_download
+
+    hub_dir = cache_dir / "hub"
+    datasets_dir = cache_dir / "datasets"
+
+    if name in EVAL_LOAD_DATASET_REPOS:
+        repo_id, split = EVAL_LOAD_DATASET_REPOS[name]
+        ds = load_dataset(
+            repo_id, split=split,
+            cache_dir=str(datasets_dir), token=token or None,
+        )
+        print(f"    cached {repo_id} [{split}]: {len(ds)} rows")
+    elif name == "gpqa":
+        # inference_mas: load_dataset("Idavidrein/gpqa", "gpqa_diamond", split="train")
+        # Gated repo: the token must have accepted the terms on the Hub.
+        ds = load_dataset(
+            "Idavidrein/gpqa", "gpqa_diamond", split="train",
+            cache_dir=str(datasets_dir), token=token or None,
+        )
+        print(f"    cached gpqa_diamond: {len(ds)} rows")
+    elif name == "mbppplus":
+        # lcb_utils.load_mbppplus_records: load_dataset("evalplus/mbppplus", split="test")
+        ds = load_dataset(
+            "evalplus/mbppplus", split="test",
+            cache_dir=str(datasets_dir), token=token or None,
+        )
+        print(f"    cached mbppplus: {len(ds)} rows")
+    elif name == "livecodebench":
+        # lcb_utils.load_release_v6_records: hf_hub_download of each release_v6 file
+        for filename in LCB_RELEASE_V6_FILES:
+            path = hf_hub_download(
+                repo_id=LCB_REPO, repo_type="dataset", filename=filename,
+                cache_dir=str(hub_dir), token=token or None,
+            )
+            print(f"    cached {filename}: {path}")
+    else:
+        raise ValueError(f"unknown eval dataset {name!r} (choices: {', '.join(EVAL_DATASETS)})")
+
+
 def download_dataset(repo_id: str, dest_dir: Path, token: str = "") -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     resolved = snapshot_download(
@@ -97,7 +169,8 @@ def download_model(repo_id: str, cache_dir: Path, token: str = "") -> Path:
 
 def main():
     p = argparse.ArgumentParser(
-        description="Download s1K, m1K, OpenCodeReasoning, ARPO-SFT into data/raw/, "
+        description="Download s1K, m1K, OpenCodeReasoning, ARPO-SFT, MATH-500, MedQA, "
+                     "AIME2025, AIME2026 into data/raw/, "
                      "and optionally predownload MAS model repos into a shared HF cache."
     )
     p.add_argument("--token", type=str, default=os.environ.get("HF_TOKEN", ""),
@@ -106,6 +179,11 @@ def main():
                    help="Root directory to download datasets into (default: data/raw)")
     p.add_argument("--skip-datasets", action="store_true",
                    help="Skip downloading the datasets (DATASET_REPOS).")
+    p.add_argument("--eval-datasets", type=str, default="",
+                   help="Comma-separated eval datasets to predownload into the shared HF "
+                        f"cache (choices: {', '.join(EVAL_DATASETS)}, or 'all'). "
+                        "These go into --hf-cache-dir (not --out-dir) so offline eval "
+                        "jobs find them.")
     p.add_argument("--models", type=str, default="",
                    help="Comma-separated MAS style names to predownload models for "
                         f"(choices: {', '.join(MODEL_STYLE_REPOS)}). "
@@ -131,6 +209,27 @@ def main():
                 print(f"  FAILED ({repo_id}): {e}")
 
         print("\nAll dataset downloads attempted. Check messages above for any failures.")
+
+    if args.eval_datasets:
+        cache_dir = Path(args.hf_cache_dir)
+        (cache_dir / "hub").mkdir(parents=True, exist_ok=True)
+        (cache_dir / "datasets").mkdir(parents=True, exist_ok=True)
+
+        names = (
+            list(EVAL_DATASETS)
+            if args.eval_datasets.strip().lower() == "all"
+            else [s.strip() for s in args.eval_datasets.split(",") if s.strip()]
+        )
+        print(f"\nPredownloading eval datasets into {cache_dir} ...")
+        for name in names:
+            print(f"  Downloading {name} ...")
+            try:
+                download_eval_dataset(name, cache_dir, token=args.token)
+                print(f"    done: {name}")
+            except Exception as e:
+                print(f"    FAILED ({name}): {e}")
+
+        print("\nAll eval dataset downloads attempted. Check messages above for any failures.")
 
     if args.models:
         # HF_HOME points to the parent; the actual hub cache lives in HF_HOME/hub.

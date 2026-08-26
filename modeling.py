@@ -2,7 +2,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -138,6 +138,41 @@ class Adapter(nn.Module):
         return self.post_ln(out)
 
 
+def _module_param_dtype(module: nn.Module) -> torch.dtype:
+    """The dtype this module's weights are stored in.
+
+    A trainable link may be held in float32 while the frozen backbones around it
+    run in bfloat16 — see `run_at_param_dtype`.  Falls back to float32 for a
+    module with no parameters.
+    """
+    for prm in module.parameters():
+        return prm.dtype
+    return torch.float32
+
+
+def run_at_param_dtype(module: nn.Module, x: torch.Tensor, fn) -> torch.Tensor:
+    """Evaluate `fn(x)` in the module's parameter dtype, return in x's dtype.
+
+    Lets a link keep float32 weights, gradients and optimizer state inside an
+    otherwise-bfloat16 pipeline without any call site having to know: the tensors
+    crossing the module boundary keep the ambient dtype, so the P2P sends between
+    pipeline stages are unchanged.
+
+    This matters for more than round-off.  A recursive link accumulates one
+    gradient contribution per round into a single `.grad` buffer, and those
+    contributions span many orders of magnitude (GRADIENT_ROUND_PROFILE.md §2-3).
+    In bfloat16 — 8 mantissa bits, eps 7.8e-3 — adding a contribution 1e-3 or more
+    below the running total discards most of it, so the early rounds are dropped
+    from the update before the optimizer ever sees them.  float32 (eps 1.2e-7)
+    keeps them.  See ROUND_GRADIENT_WEIGHTING.md.
+    """
+    in_dtype = x.dtype
+    p_dtype = _module_param_dtype(module)
+    if in_dtype == p_dtype:
+        return fn(x)
+    return fn(x.to(p_dtype)).to(in_dtype)
+
+
 class CrossModelAdapter(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, adapter_type: str) -> None:
         super().__init__()
@@ -155,6 +190,9 @@ class CrossModelAdapter(nn.Module):
         self.residual_proj = nn.Linear(in_dim, out_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return run_at_param_dtype(self, x, self._forward)
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.ln_source(x)
         out = self.proj2(self.act(self.proj1(h)))
         out = out + self.residual_proj(x)
@@ -252,8 +290,12 @@ class SharedRecursiveLink(nn.Module):
             self._rope_cache[key] = (cos.to(dtype), sin.to(dtype))
         return self._rope_cache[key]
 
-    def forward(self, h: torch.Tensor, src: int, dst: int) -> torch.Tensor:
-        """h: (B, T, hidden_dims[src-1]);  src/dst are 1-indexed agent indices."""
+    def _latent_core(self, h: torch.Tensor, src: int, dst: int) -> torch.Tensor:
+        """Transition output in the shared latent space (before out_proj).
+
+        h: (B, T, hidden_dims[src-1]);  src/dst are 1-indexed agent indices.
+        Returns (B, T, shared_dim): skip + alpha * MoE.
+        """
         # Skip connection in latent space: hidden_dims[src] → d
         skip = self.skip_proj[src](h)
 
@@ -274,8 +316,19 @@ class SharedRecursiveLink(nn.Module):
         h1 = self.act(torch.einsum("btd,kde->btke", normed, W1) + b1)
         h2 = (torch.einsum("btke,ked->btd", h1 * w.unsqueeze(-1), W2)
               + (w @ b2).squeeze(1).unsqueeze(1))
-        # Combine in latent space, then project to dst hidden dim
-        return self.out_proj[dst](skip + self.alpha * h2)
+        return skip + self.alpha * h2
+
+    def _project_out(self, x: torch.Tensor, dst: int) -> torch.Tensor:
+        """Project a shared-latent tensor to dst's hidden dim (variants override)."""
+        return self.out_proj[dst](x)
+
+    def forward(self, h: torch.Tensor, src: int, dst: int) -> torch.Tensor:
+        """h: (B, T, hidden_dims[src-1]);  src/dst are 1-indexed agent indices."""
+        # Combine in latent space, then project to dst hidden dim.  Runs in the
+        # link's own parameter dtype so float32 link weights work unchanged inside
+        # a bfloat16 pipeline; the returned tensor keeps h's dtype.
+        return run_at_param_dtype(
+            self, h, lambda t: self._project_out(self._latent_core(t, src, dst), dst))
 
 
 def load_shared_recursive_link(
@@ -318,3 +371,235 @@ def load_shared_recursive_link(
         p.requires_grad_(False)
     return module
 
+
+class SharedRecursiveStateLink(SharedRecursiveLink):
+    """
+    SharedRecursiveLink plus a shared recursive state z that bypasses one
+    complete MAS recursion round.
+
+    Pairwise transitions (planner→critic, critic→solver, agent self-loops)
+    behave exactly like SharedRecursiveLink.  The solver→planner round
+    boundary is replaced by a residual update of a persistent state in the
+    shared latent space:
+
+        f^(r)   = skip_proj[3](h_solver) + alpha * MoE(...)   (latent feedback)
+        z^(1)   = f^(1)                                       (round-1 init)
+        z^(r+1) = z^(r) + gamma * f^(r+1)
+        p^(r+1) = out_proj[1](z^(r+1))                        (planner prefix)
+
+    so dz^(r+1)/dz^(r) = I + gamma * J_F.  With gamma ReZero-initialised
+    (~1e-3), the product prod_r (I + gamma J_r) over R recursion rounds stays
+    close to identity while gamma * ||J_r|| is small, keeping cross-round
+    gradients stable; the model learns how far to move away from identity.
+
+    Usage per round (replaces `shared_link(solver_h, src=3, dst=1)`):
+
+        feedback, state = link.round_feedback(solver_h, state)   # state=None on round 1
+    """
+
+    def __init__(self, hidden_dims: List[int], shared_dim: int,
+                 n_experts: int = 4, expert_dim_divisor: int = 4,
+                 gamma_init: float = 1e-3):
+        super().__init__(hidden_dims, shared_dim,
+                         n_experts=n_experts, expert_dim_divisor=expert_dim_divisor)
+        # Round-bypass gate: near-identity round-to-round Jacobian at init.
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+
+    def round_feedback(
+        self,
+        solver_h: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Solver→planner round boundary with residual state update.
+
+        solver_h: (B, T, hidden_dims[2]) solver latent rollout output.
+        state:    (B, T, shared_dim) recursive state z from the previous
+                  round, or None on round 1.
+
+        Returns (feedback_prefix, new_state):
+          feedback_prefix: (B, T, hidden_dims[0]) planner prefix for the next
+                           round — out_proj[1](z_new).
+          new_state:       (B, T, shared_dim) z to carry into the next round.
+        """
+        # The recursive state is kept in the link's parameter dtype for the whole
+        # chain, never the ambient pipeline dtype.  The update is z + gamma*f with
+        # gamma ReZero-initialised at ~1e-3, which sits below bfloat16's eps of
+        # 7.8e-3.  Measured at the production state shape (1x48x1024 = 49,152
+        # coords), bfloat16 lands 48-81% of the correct norm change while moving
+        # only 7-22% of the coordinates: z receives a sparsified, biased version of
+        # the update rather than the update.  float32 moves all of them.
+        # See ROUND_GRADIENT_WEIGHTING.md.
+        in_dtype = solver_h.dtype
+        p_dtype = _module_param_dtype(self)
+        f = self._latent_core(solver_h.to(p_dtype), src=3, dst=1)
+        state = f if state is None else state.to(p_dtype) + self.gamma * f
+        return self._project_out(state, 1).to(in_dtype), state
+
+
+def load_shared_recursive_state_link(
+    ckpt_dir: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> "SharedRecursiveStateLink":
+    """
+    Load a SharedRecursiveStateLink from a checkpoint directory.
+
+    Accepts both native shared_state checkpoints and plain shared_roae
+    checkpoints (warm start): missing beta/gamma are filled with their
+    ReZero inits, which reproduces the parent's behaviour up to the
+    round-boundary state rewiring.
+    """
+    config_path = Path(ckpt_dir) / "shared_roae_config.json"
+    weights_path = Path(ckpt_dir) / "shared_recursive_link.pt"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"shared_roae_config.json not found in {ckpt_dir}")
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"shared_recursive_link.pt not found in {ckpt_dir}")
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    module = SharedRecursiveStateLink(
+        hidden_dims=cfg["hidden_dims"],
+        shared_dim=cfg["shared_dim"],
+        n_experts=cfg["n_experts"],
+        expert_dim_divisor=cfg.get("expert_dim_divisor", 4),
+        gamma_init=cfg.get("gamma_init", 1e-3),
+    )
+    sd = torch.load(str(weights_path), map_location="cpu")
+    if "beta" not in sd:
+        sd["beta"] = torch.tensor(1e-3)
+    if "gamma" not in sd:
+        sd["gamma"] = torch.tensor(float(cfg.get("gamma_init", 1e-3)))
+    module.load_state_dict(sd, strict=True)
+    module.to(device=device, dtype=dtype).eval()
+    for p in module.parameters():
+        p.requires_grad_(False)
+    return module
+
+
+
+class SharedRecursiveTiedLink(SharedRecursiveLink):
+    """
+    SharedRecursiveLink with tied source/destination projections: O_i = S_i^T.
+
+    The parent decodes the shared latent with an independently *randomly*
+    initialised out_proj, so the init-time transition Jacobian is
+    J_{s->d}^(0) ~= O_d S_s — even with orthogonal S_s, the random O_d can
+    shrink or distort gradients.  Here the decoder is tied to the (semi-)
+    orthogonal skip encoder of the destination agent:
+
+        S_i : R^{h_i} -> R^d   (skip_proj, orthogonal init)
+        O_i = S_i^T : R^d -> R^{h_i}   (no independent parameters)
+
+    so a same-agent round trip is O_i S_i = S_i^T S_i — exactly the identity
+    when d >= h_i, and a rank-d orthogonal projector with unit singular values
+    in the retained subspace when d < h_i.  Cross-agent transfer starts at
+    R_{i->j}^(0) = S_j^T S_i, whose singular values are likewise close to one
+    within the retained subspace — preserving both forward norms and backward
+    gradients at init.  A free zero-init bias per destination agent keeps the
+    decoder affine without touching the Jacobian.
+
+    State dict: no out_proj weights (Identity placeholders); adds out_bias.
+    """
+
+    def __init__(self, hidden_dims: List[int], shared_dim: int,
+                 n_experts: int = 4, expert_dim_divisor: int = 4):
+        super().__init__(hidden_dims, shared_dim,
+                         n_experts=n_experts, expert_dim_divisor=expert_dim_divisor)
+        # Drop the independent decoders; decoding reuses skip_proj transposed.
+        self.out_proj = nn.ModuleList(
+            [nn.Identity() for _ in range(len(hidden_dims) + 1)]
+        )
+        # Free affine offset per destination agent (index dst-1), zero-init.
+        self.out_bias = nn.ParameterList(
+            [nn.Parameter(torch.zeros(h)) for h in hidden_dims]
+        )
+
+    def _project_out(self, x: torch.Tensor, dst: int) -> torch.Tensor:
+        w = self.skip_proj[dst].weight          # (d, h_dst): S_dst
+        return torch.nn.functional.linear(x, w.t(), self.out_bias[dst - 1])
+
+    @torch.no_grad()
+    def re_orthonormalize_(self) -> None:
+        """Retract each skip encoder back to the Stiefel manifold (QR, float32).
+
+        Every transition Jacobian is S_dst^T S_src — quadratic in S's singular
+        values — and the latent-rollout self-loop applies S_i^T S_i once per
+        latent step, so any singular value drifting above 1 during training is
+        amplified as sigma^(2*latent_steps) and overflows bf16 within a few
+        steps.  Call this after every optimizer step: it projects S back to
+        exact (semi-)orthogonality, i.e. projected gradient descent on the
+        manifold the tied design assumes.
+        """
+        for proj in self.skip_proj[1:]:
+            W = proj.weight
+            rows, cols = W.shape
+            A = W.float().t() if rows < cols else W.float()   # tall (m >= n)
+            Q, R = torch.linalg.qr(A, mode="reduced")
+            s = torch.sign(torch.diagonal(R))                 # continuous retraction
+            s[s == 0] = 1.0
+            Q = Q * s
+            W.copy_((Q.t() if rows < cols else Q).to(W.dtype))
+
+    @torch.no_grad()
+    def max_singular_value(self) -> float:
+        """Largest singular value across the skip encoders (drift diagnostic)."""
+        return max(
+            torch.linalg.svdvals(proj.weight.float())[0].item()
+            for proj in self.skip_proj[1:]
+        )
+
+
+def load_shared_recursive_tied_link(
+    ckpt_dir: Path,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> "SharedRecursiveTiedLink":
+    """
+    Load a SharedRecursiveTiedLink from a checkpoint directory.
+
+    Accepts native shared_tied checkpoints, and warm starts from plain
+    shared_roae checkpoints: independent out_proj weights are dropped (the
+    tied decoder replaces them) and missing out_bias/beta entries are filled
+    with their inits.
+    """
+    config_path = Path(ckpt_dir) / "shared_roae_config.json"
+    weights_path = Path(ckpt_dir) / "shared_recursive_link.pt"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"shared_roae_config.json not found in {ckpt_dir}")
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"shared_recursive_link.pt not found in {ckpt_dir}")
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    module = SharedRecursiveTiedLink(
+        hidden_dims=cfg["hidden_dims"],
+        shared_dim=cfg["shared_dim"],
+        n_experts=cfg["n_experts"],
+        expert_dim_divisor=cfg.get("expert_dim_divisor", 4),
+    )
+    sd = torch.load(str(weights_path), map_location="cpu")
+    sd = adapt_state_dict_for_tied_link(sd, cfg["hidden_dims"])
+    module.load_state_dict(sd, strict=True)
+    module.to(device=device, dtype=dtype).eval()
+    for p in module.parameters():
+        p.requires_grad_(False)
+    return module
+
+
+def adapt_state_dict_for_tied_link(sd: dict, hidden_dims: List[int]) -> dict:
+    """Convert a shared_roae/shared_tied state dict to SharedRecursiveTiedLink's
+    layout: drop independent out_proj weights, carry out_proj biases into
+    out_bias, fill anything still missing with its init."""
+    sd = {k: v for k, v in sd.items() if not (k.startswith("out_proj.") and k.endswith(".weight"))}
+    for i, h in enumerate(hidden_dims):
+        key = f"out_bias.{i}"
+        if key not in sd:
+            legacy = sd.pop(f"out_proj.{i + 1}.bias", None)
+            sd[key] = legacy if legacy is not None else torch.zeros(h)
+    sd = {k: v for k, v in sd.items() if not k.startswith("out_proj.")}
+    if "beta" not in sd:
+        sd["beta"] = torch.tensor(1e-3)
+    return sd

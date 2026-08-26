@@ -80,5 +80,11 @@ DATASET_DEFAULT_SPLIT = {
     "local/medqa": "train",
     "mbppplus": "test",
     "evalplus/mbppplus": "test",
+    "aime2025": "test",
+    "aime25": "test",
+    "math-ai/aime25": "test",
+    "aime2026": "test",
+    "aime26": "test",
+    "math-ai/aime26": "test",
 }
 

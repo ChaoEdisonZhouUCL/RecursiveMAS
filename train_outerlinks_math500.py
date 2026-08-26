@@ -53,6 +53,7 @@ Usage
 
 import argparse
 import copy
+import json
 import math
 import os
 import time
@@ -86,9 +87,31 @@ from modeling import (
     CrossModelAdapter,
     OUTER_ADAPTER_TYPE,
     SharedRecursiveLink,
+    SharedRecursiveStateLink,
+    SharedRecursiveTiedLink,
+    adapt_state_dict_for_tied_link,
     infer_outer_adapter_type_from_state_dict,
 )
+
+# Modes that train a single shared link module instead of pairwise outer adapters.
+SHARED_MODES = ("shared_roae", "shared_state", "shared_tied")
+SHARED_LINK_CLS = {
+    "shared_roae":  SharedRecursiveLink,
+    "shared_state": SharedRecursiveStateLink,
+    "shared_tied":  SharedRecursiveTiedLink,
+}
+SHARED_ADAPTER_TYPE = {
+    "shared_roae":  "shared_recursive_link",
+    "shared_state": "shared_recursive_state_link",
+    "shared_tied":  "shared_recursive_tied_link",
+}
 from hf_resolver import resolve_inner_adapter, snapshot_repo, task_for_inner_repo
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 from prompts import (
     FEEDBACK_SLOT, PLANNER_SLOT, REFINED_SLOT,
     build_math_planner_prompt,
@@ -785,46 +808,172 @@ class GradMonitor:
     how much of the final-round loss signal reaches round r's Planner stage.
     """
 
+    # Inter-link keys: "12" planner→critic, "23" critic→solver, "31" solver→planner
+    # feedback, "state" the shared_state recursive-state path z (which carries the
+    # cross-round gradient that bypasses the "31" feedback tensor).
+    # "shared" is not a transition: in the shared_* modes all three transitions
+    # are the SAME module, and each pipeline stage's backward only touches part
+    # of it, so "12"/"23"/"31" there are per-stage shares.  "shared" carries the
+    # whole module's per-round gradient, summed over the three stages.
+    LINKS = ("12", "23", "31", "state", "shared")
+
     def __init__(self, n_rounds: int):
         self.n_rounds  = n_rounds
-        self.norms: Dict[int, List[float]] = {r: [] for r in range(n_rounds)}
+        self.norms: Dict[str, Dict[int, List[float]]] = {
+            l: {r: [] for r in range(n_rounds)} for l in self.LINKS
+        }
         self._handles  = []
-        self._step_buf: Dict[int, List[float]] = {r: [] for r in range(n_rounds)}
+        self._step_buf: Dict[str, Dict[int, List[float]]] = {
+            l: {r: [] for r in range(n_rounds)} for l in self.LINKS
+        }
+        # `norms` above is the gradient arriving at the link's OUTPUT ACTIVATION.
+        # `param_norms` is the gradient arriving at the link's WEIGHTS — the norm
+        # over the whole module, per round.  They answer different questions and
+        # routinely disagree: dL/dW = dL/dy * x^T, so a link fed a small input has
+        # a small weight gradient even when its activation gradient is large.
+        # "How does this link's gradient norm evolve across rounds" is this one:
+        # it is the quantity the optimizer actually consumes.
+        self.param_norms: Dict[str, Dict[int, List[float]]] = {
+            l: {r: [] for r in range(n_rounds)} for l in self.LINKS
+        }
+        self._param_step_buf: Dict[str, Dict[int, List[float]]] = {
+            l: {r: [] for r in range(n_rounds)} for l in self.LINKS
+        }
 
-    def register_output(self, tensor: torch.Tensor, round_idx: int):
+    def record_param_delta(self, link: str, round_idx: int, value: float):
+        """Record one round's contribution to `link`'s parameter gradients.
+
+        An exactly-zero delta is dropped rather than stored.  `.grad` buffers are
+        zeroed but kept allocated each step, so a stage that never touches the
+        link leaves its buffer bit-identical and the delta is exactly 0.0 — which
+        means "this round has no such term", not "this round contributed a zero
+        gradient".  That happens on the final round in every mode: it ends in a
+        teacher-forced pass that neither produces feedback nor runs a latent
+        rollout, so the solver stage does not touch the link at all.
+
+        The distinction is not cosmetic.  Storing the 0.0 puts a -inf on a log
+        axis and turns the round-1/round-N ratio into a meaningless 1e6
+        "EXPLODING" verdict.  A genuine gradient is never exactly zero across
+        millions of fp32 coordinates unless the incoming gradient was itself all
+        zeros — in which case the round trained the link exactly as much as no
+        term would have.
+        """
+        if value != 0.0:
+            self._param_step_buf[link][round_idx].append(value)
+
+    def register_output(self, tensor: torch.Tensor, round_idx: int, link: str = "12"):
         if not tensor.requires_grad:
             raise RuntimeError(
-                f"GradMonitor: tensor for round {round_idx} has requires_grad=False."
+                f"GradMonitor: tensor for link {link} round {round_idx} has requires_grad=False."
             )
 
         def _hook(grad):
             if grad is not None:
-                self._step_buf[round_idx].append(grad.detach().float().norm().item())
+                self._step_buf[link][round_idx].append(grad.detach().float().norm().item())
 
         self._handles.append(tensor.register_hook(_hook))
 
-    def commit_step(self):
-        for r in range(self.n_rounds):
-            vals = self._step_buf[r]
-            self.norms[r].append(float(np.mean(vals)) if vals else float("nan"))
-            self._step_buf[r] = []
+    def commit_step(self, n_microbatches: int = 1):
+        # A tensor hook fires once per backward() call that reaches it, carrying
+        # only that call's incremental gradient.  The pipeline backward is staged
+        # per round, so a tensor consumed by two rounds — the shared_state
+        # recursive state z^(r), read both by round r's out_proj and by round
+        # r+1's z update — is reached by two separate backward() calls and fires
+        # twice.  The step's true gradient is the SUM of those firings, so
+        # averaging over firings would under-report it by the fan-out (exactly
+        # 2x for z^(r), r < n_rounds-2).  Sum within the step and divide by the
+        # micro-batch count instead: links that fire once per micro-batch are
+        # unaffected (sum/n_microbatches == mean), and fan-out links are correct.
+        for link in self.LINKS:
+            for r in range(self.n_rounds):
+                for buf, store in ((self._step_buf, self.norms),
+                                   (self._param_step_buf, self.param_norms)):
+                    vals = buf[link][r]
+                    store[link][r].append(
+                        float(np.sum(vals) / max(1, n_microbatches)) if vals else float("nan")
+                    )
+                    buf[link][r] = []
         for h in self._handles:
             h.remove()
         self._handles = []
 
 
+class LinkParamGradTracker:
+    """Reads off one round's contribution to a link's parameter gradients.
+
+    A link's weights are shared across rounds, so once backward finishes `.grad`
+    holds the SUM over rounds and the individual terms are unrecoverable — which
+    is why simply reading `.grad` cannot answer "what did round r contribute".
+    The pipeline backward is staged one round at a time (see the descending `for
+    r` loop in run_training), so round r's term is exactly the increment `.grad`
+    gains while that stage runs: snapshot before, subtract after.
+
+    Note this is the norm OF THE DELTA, not the delta of the norm.  The two
+    differ whenever two rounds push the weights in different directions, and only
+    the former is the round's actual gradient.
+    """
+
+    def __init__(self, module: Optional[nn.Module]):
+        self.params = ([p for p in module.parameters() if p.requires_grad]
+                       if module is not None else [])
+        self._snap: List[Optional[torch.Tensor]] = []
+
+    def snapshot(self) -> None:
+        self._snap = [None if p.grad is None else p.grad.detach().clone()
+                      for p in self.params]
+
+    def delta_norm(self) -> float:
+        total = None
+        for p, prev in zip(self.params, self._snap):
+            if p.grad is None:
+                continue
+            d = p.grad.detach() if prev is None else (p.grad.detach() - prev)
+            sq = d.float().pow(2).sum()          # accumulate on device;
+            total = sq if total is None else total + sq   # one sync at the end
+        return float(total.sqrt().item()) if total is not None else float("nan")
+
+    def delta_into(self, flat: torch.Tensor) -> None:
+        """Add this round's delta into `flat`, laid out as `self.params` flattened.
+
+        Needed for the shared link, whose per-round gradient can only be summed
+        across pipeline stages as a vector — norms are not additive, so the
+        scalar from `delta_norm` cannot be combined across ranks.
+        """
+        off = 0
+        for p, prev in zip(self.params, self._snap):
+            n = p.numel()
+            if p.grad is not None:
+                d = p.grad.detach() if prev is None else (p.grad.detach() - prev)
+                flat[off:off + n] += d.reshape(-1).float()
+            off += n
+
+
+# Pipeline agent that observes each link's gradient (hooks fire locally there).
+_LINK_OWNER_AGENT = {"12": "planner", "23": "critic", "31": "solver", "state": "solver",
+                     # already all-reduced, so every rank holds the same value
+                     "shared": "planner"}
+
 
 def _sync_norms_all_ranks(monitor: Optional["GradMonitor"], n_rounds: int):
-    """Broadcast per-round grad norms from rank_planner to all ranks.
-    Must be called by every rank every step so the broadcast collective is balanced."""
-    for r in range(n_rounds):
-        val = torch.tensor(
-            [monitor.norms[r][-1] if (monitor is not None and monitor.norms[r]) else float("nan")],
-            dtype=torch.float32, device=f"cuda:{_rank()}"
-        )
-        dist.broadcast(val, src=RANK_PLANNER)
-        if monitor is not None and _rank() != RANK_PLANNER:
-            monitor.norms[r].append(val.item())
+    """Broadcast each link's per-round grad norms from its owner rank to all ranks.
+    Must be called by every rank every step so the broadcast collectives are balanced."""
+    # Both stores are synced: activation norms (`norms`) and whole-module
+    # parameter-gradient norms (`param_norms`).  Every rank must run every
+    # broadcast so the collectives stay balanced, hence the fixed loop order.
+    for store_name in ("norms", "param_norms"):
+        for link in GradMonitor.LINKS:
+            owner = _pipeline_rank(_LINK_OWNER_AGENT[link])
+            store = getattr(monitor, store_name) if monitor is not None else None
+            for r in range(n_rounds):
+                val = torch.tensor(
+                    [store[link][r][-1]
+                     if (store is not None and store[link][r]) else float("nan")],
+                    dtype=torch.float32, device=f"cuda:{_rank()}"
+                )
+                dist.broadcast(val, src=owner)
+                if store is not None and _rank() != owner and store[link][r]:
+                    # commit_step already appended a local NaN; replace with owner's.
+                    store[link][r][-1] = val.item()
 
 
 # ── Single round (pipeline-aware) ────────────────────────────────────────────
@@ -848,6 +997,7 @@ def forward_one_round(
     debug: bool = False,
     is_last_round: bool = False,
     keep_solver_logits: bool = False,
+    round_state: Optional[torch.Tensor] = None,   # z from previous round (shared_state mode, rank rs only)
 ):
     """
     One Planner→Critic→Solver forward round (paper §3-4, Fig.1).
@@ -889,8 +1039,8 @@ def forward_one_round(
         else:
             critic_prefix = outer_12(planner_h)
         del planner_h
-        if monitor is not None:
-            monitor.register_output(critic_prefix, round_idx)
+        if monitor is not None and critic_prefix.requires_grad:
+            monitor.register_output(critic_prefix, round_idx, link="12")
         if critic_prefix.requires_grad:
             critic_prefix.retain_grad()
         out["critic_prefix"] = critic_prefix
@@ -923,6 +1073,8 @@ def forward_one_round(
         del critic_h
         if solver_prefix.requires_grad:
             solver_prefix.retain_grad()
+            if monitor is not None:
+                monitor.register_output(solver_prefix, round_idx, link="23")
         out["solver_prefix_rc"] = solver_prefix
         if pipeline and rc != rs:
             _send_tensor(solver_prefix, dst=rs)
@@ -1004,12 +1156,23 @@ def forward_one_round(
                 agent_idx=3, shared_link=shared_link,
             )
             del solver_input, solver_am   # free prompt embeddings before outer link
-            if shared_link is not None:
+            if isinstance(shared_link, SharedRecursiveStateLink):
+                # shared_state: residual recursive state bypasses the full round —
+                # z' = z + gamma * F(z); the planner prefix is out_proj[1](z').
+                feedback, new_round_state = shared_link.round_feedback(solver_h, round_state)
+                out["round_state"] = new_round_state
+                # The cross-round gradient travels through z, not the feedback
+                # tensor — monitor it as its own link.
+                if monitor is not None and new_round_state.requires_grad:
+                    monitor.register_output(new_round_state, round_idx, link="state")
+            elif shared_link is not None:
                 feedback = shared_link(solver_h, src=3, dst=1)
             else:
                 feedback = outer_31(solver_h)
             if feedback.requires_grad:
                 feedback.retain_grad()
+                if monitor is not None:
+                    monitor.register_output(feedback, round_idx, link="31")
             del solver_h
 
             out["feedback"] = feedback
@@ -1252,6 +1415,7 @@ def eval_probe(
 
     with torch.no_grad():
         feedback_prefix = None
+        round_state = None
         for r in range(n_rounds):
             out = forward_one_round(
                 planner_mdl, planner_tok, planner_inner,
@@ -1269,7 +1433,10 @@ def eval_probe(
                 shared_link=shared_link,
                 is_last_round=(r == n_rounds - 1),
                 keep_solver_logits=True,   # eval_probe needs logits to decode
+                round_state=round_state,
             )
+            if rank == rs:
+                round_state = out.get("round_state", round_state)
             if r < n_rounds - 1:
                 pipeline = _is_dist() and (rp != rc or rc != rs)
                 if pipeline and rs != rp:
@@ -1324,6 +1491,12 @@ def run_training(cfg, device: torch.device, mode: str = "original",
     world = _world()
     _dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     dtype = _dtype_map[getattr(cfg, "dtype", "float32")]
+    # dtype of the trained link.  Kept separate from the pipeline dtype: the
+    # backbones are frozen, so their precision only has to be good enough for the
+    # forward pass, whereas the link's precision also governs whether each round's
+    # gradient survives accumulation.  See ROUND_GRADIENT_WEIGHTING.md.
+    _link_dtype_name = getattr(cfg, "link_dtype", "float32")
+    link_dtype = dtype if _link_dtype_name == "same" else _dtype_map[_link_dtype_name]
 
     if rank == 0:
         skip_tag = "" if use_round_skip else "  round_skip=OFF"
@@ -1341,12 +1514,74 @@ def run_training(cfg, device: torch.device, mode: str = "original",
 
     grad_checkpoint = getattr(cfg, "grad_checkpoint", False)
 
+    # ── W&B: one run per (mode, n_rounds, round_skip) combination, logged from
+    # the planner rank only (rank 0 == RANK_PLANNER). Every rank runs its own
+    # agent forward/backward pass, but only rank 0 has the synced loss, the
+    # shared-link gate values, and the grad-norm monitor after
+    # _sync_norms_all_ranks — so it's the only rank with anything meaningful
+    # to log; the other ranks never touch wandb.
+    use_wandb = bool(getattr(cfg, "wandb", False)) and rank == 0
+    if use_wandb and wandb is None:
+        print("[wandb] --wandb was passed but the wandb package is not installed "
+              "(pip install wandb); continuing without logging.")
+        use_wandb = False
+    if use_wandb:
+        skip_tag_wb = "skip" if use_round_skip else "noskip"
+        run_name = (getattr(cfg, "wandb_run_name", "") or
+                    f"{mode}_r{cfg.n_rounds}_{skip_tag_wb}_{time.strftime('%Y%m%d_%H%M%S')}")
+        wandb.init(
+            project=getattr(cfg, "wandb_project", "recursivemas-outerlinks") or None,
+            entity=getattr(cfg, "wandb_entity", "") or None,
+            name=run_name,
+            mode=getattr(cfg, "wandb_mode", "offline"),
+            reinit="finish_previous",   # compare/sweep modes call run_training multiple times per process
+            config={
+                "mode": mode,
+                "use_round_skip": use_round_skip,
+                "n_rounds": cfg.n_rounds,
+                "latent_steps": cfg.latent_steps,
+                "steps": cfg.steps,
+                "lr": cfg.lr,
+                "batch_size": cfg.batch_size,
+                "grad_accum": getattr(cfg, "grad_accum", 1),
+                "effective_batch_size": cfg.batch_size * getattr(cfg, "grad_accum", 1),
+                "dtype": getattr(cfg, "dtype", "float32"),
+                "dataset": cfg.dataset,
+                "max_seq_len": getattr(cfg, "max_seq_len", 0),
+                "n_samples": cfg.n_samples,
+                "seed": cfg.seed,
+                "n_experts": getattr(cfg, "n_experts", None),
+                "expert_dim_divisor": getattr(cfg, "expert_dim_divisor", None),
+                "n_ckpt": getattr(cfg, "n_ckpt", 1),
+                "grad_checkpoint": grad_checkpoint,
+                "resume_ckpt": getattr(cfg, "resume_ckpt", "") or None,
+                "world_size": world,
+                "planner_repo": PLANNER_REPO,
+                "critic_repo": CRITIC_REPO,
+                "solver_repo": SOLVER_REPO,
+            },
+        )
+        # Remember which W&B run this is so the eval jobs — which run later, in
+        # separate SLURM jobs on offline compute nodes — can attach their metrics
+        # to this same run.  Written into the run directory below, next to the
+        # checkpoints the eval jobs are pointed at.
+        _wandb_meta = {
+            "id":      wandb.run.id,
+            "name":    wandb.run.name,
+            "project": wandb.run.project,
+            "entity":  wandb.run.entity,
+            "mode":    getattr(cfg, "wandb_mode", "offline"),
+            "offline_dir": getattr(wandb.run, "dir", None),
+        }
+    else:
+        _wandb_meta = None
+
     if rank == rp:
         if rank == 0: print("Loading Planner...")
         planner_mdl, planner_tok = load_model_and_tokenizer(PLANNER_REPO, device, dtype)
         if grad_checkpoint:
             planner_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        if mode != "shared_roae":
+        if mode not in SHARED_MODES:
             planner_inner = load_inner_adapter(PLANNER_REPO, PLANNER_DIM, device, dtype)
             for p in planner_inner.parameters(): p.requires_grad_(False)
 
@@ -1355,7 +1590,7 @@ def run_training(cfg, device: torch.device, mode: str = "original",
         critic_mdl, critic_tok = load_model_and_tokenizer(CRITIC_REPO, device, dtype)
         if grad_checkpoint:
             critic_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        if mode != "shared_roae":
+        if mode not in SHARED_MODES:
             critic_inner = load_inner_adapter(CRITIC_REPO, CRITIC_DIM, device, dtype)
             for p in critic_inner.parameters(): p.requires_grad_(False)
 
@@ -1364,7 +1599,7 @@ def run_training(cfg, device: torch.device, mode: str = "original",
         solver_mdl, solver_tok = load_model_and_tokenizer(SOLVER_REPO, device, dtype)
         if grad_checkpoint:
             solver_mdl.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        if mode != "shared_roae":
+        if mode not in SHARED_MODES:
             solver_inner = load_inner_adapter(SOLVER_REPO, SOLVER_DIM, device, dtype)
             for p in solver_inner.parameters(): p.requires_grad_(False)
 
@@ -1374,38 +1609,40 @@ def run_training(cfg, device: torch.device, mode: str = "original",
     outer_12 = outer_23 = outer_31 = None
     shared_link = None
 
-    if mode == "shared_roae":
+    if mode in SHARED_MODES:
         hidden_dims = [PLANNER_DIM, CRITIC_DIM, SOLVER_DIM]
         shared_dim  = 1024
-        shared_link = SharedRecursiveLink(
+        link_cls = SHARED_LINK_CLS[mode]
+        shared_link = link_cls(
             hidden_dims=hidden_dims,
             shared_dim=shared_dim,
             n_experts=getattr(cfg, "n_experts", 4),
             expert_dim_divisor=getattr(cfg, "expert_dim_divisor", 4),
-        ).to(device=device, dtype=dtype).train()
+        ).to(device=device, dtype=link_dtype).train()
         if not use_round_skip:
             # Ablation: freeze beta=0 so round-skip is disabled throughout training.
             shared_link.beta.data.zero_()
             shared_link.beta.requires_grad_(False)
         if rank == 0:
             n_sl = sum(p.numel() for p in shared_link.parameters() if p.requires_grad)
-            print(f"SharedRecursiveLink trainable params: {n_sl:,}  (shared dim={shared_dim})"
-                  f"  round_skip={'on' if use_round_skip else 'OFF'}")
+            print(f"{link_cls.__name__} trainable params: {n_sl:,}  (shared dim={shared_dim})"
+                  f"  round_skip={'on' if use_round_skip else 'OFF'}"
+                  f"  link_dtype={str(link_dtype).split('.')[-1]}")
     else:
         # Randomly initialise outer links — only these are trained; pretrained
         # weights are intentionally NOT loaded so the adapters start from scratch.
         if rank == rp:
             outer_12 = CrossModelAdapter(
                 in_dim=PLANNER_DIM, out_dim=CRITIC_DIM, adapter_type=OUTER_ADAPTER_TYPE,
-            ).to(device=device, dtype=dtype).train()
+            ).to(device=device, dtype=link_dtype).train()
         if rank == rc:
             outer_23 = CrossModelAdapter(
                 in_dim=CRITIC_DIM, out_dim=SOLVER_DIM, adapter_type=OUTER_ADAPTER_TYPE,
-            ).to(device=device, dtype=dtype).train()
+            ).to(device=device, dtype=link_dtype).train()
         if rank == rs:
             outer_31 = CrossModelAdapter(
                 in_dim=SOLVER_DIM, out_dim=PLANNER_DIM, adapter_type=OUTER_ADAPTER_TYPE,
-            ).to(device=device, dtype=dtype).train()
+            ).to(device=device, dtype=link_dtype).train()
 
     # ── Optimiser: each rank optimises only its own outer link ───────────────
     local_params = []
@@ -1419,6 +1656,21 @@ def run_training(cfg, device: torch.device, mode: str = "original",
     n_trainable = sum(p.numel() for p in local_params)
     if rank == 0:
         print(f"Trainable outer-link parameters (rank {rank}): {n_trainable:,}")
+
+    # Parameters synchronised across pipeline ranks each step.  This list must be
+    # IDENTICAL in content and order on every rank: the gradient all-reduce below
+    # flattens it into one buffer, so rank r's slot k must hold the same parameter
+    # as rank r'-s slot k.  Deriving it from `p.requires_grad` (a property of how
+    # the module was built) satisfies that; deriving it from `p.grad is not None`
+    # does NOT, because each pipeline stage's backward only touches its own
+    # transition's projections — see the comment on the all-reduce.
+    sync_params = ([p for p in local_params if p.requires_grad]
+                   if shared_link is not None else [])
+    # Materialise the gradient buffers up front so the layout is stable from step
+    # 0 onward, before any backward has run.
+    for p in sync_params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
 
     optimizer = AdamW(local_params, lr=cfg.lr, weight_decay=0.01) if local_params else None
     warmup_steps = max(1, cfg.steps // 10)
@@ -1449,12 +1701,20 @@ def run_training(cfg, device: torch.device, mode: str = "original",
             print(f"\n[resume] Loading from {resume_ckpt}")
 
         # Load adapter weights (same logic as fresh init but from saved state dicts).
-        if mode == "shared_roae" and shared_link is not None:
+        if mode in SHARED_MODES and shared_link is not None:
             _w = resume_ckpt / "shared_recursive_link.pt"
             if _w.is_file():
                 sd = torch.load(str(_w), map_location=device)
                 if "beta" not in sd:
                     sd["beta"] = torch.tensor(1e-3)
+                # shared_state warm start from a shared_roae checkpoint: gamma
+                # gets its ReZero init, so behaviour starts at the parent's.
+                if mode == "shared_state" and "gamma" not in sd:
+                    sd["gamma"] = torch.tensor(1e-3)
+                # shared_tied warm start: drop independent out_proj weights and
+                # carry their biases into out_bias (decoder is tied to skip_proj).
+                if mode == "shared_tied":
+                    sd = adapt_state_dict_for_tied_link(sd, shared_link.hidden_dims)
                 shared_link.load_state_dict(sd, strict=True)
                 if rank == 0:
                     print(f"  [resume] loaded shared_recursive_link.pt")
@@ -1536,7 +1796,10 @@ def run_training(cfg, device: torch.device, mode: str = "original",
     _barrier()
 
     # ── Training ─────────────────────────────────────────────────────────────
-    monitor = GradMonitor(cfg.n_rounds) if rank == rp else None
+    # Every pipeline rank monitors the links whose gradients it observes locally
+    # (12 on planner, 23 on critic, 31/state on solver); values are synced after
+    # each step so all ranks hold the full picture.
+    monitor = GradMonitor(cfg.n_rounds)
 
     if rank == 0:
         print(f"\n{'='*70}")
@@ -1545,6 +1808,39 @@ def run_training(cfg, device: torch.device, mode: str = "original",
         print(f"{'='*70}")
 
     pipeline = _is_dist() and (rp != rc or rc != rs)
+
+    # Which link's WEIGHTS this rank updates, and hence whose per-round parameter
+    # gradient it can measure.  In `original` mode each rank holds exactly one
+    # adapter, so the key names that adapter.  In the shared modes every rank
+    # holds a replica of the same link, so the key names the pipeline STAGE whose
+    # backward runs here and the value is that stage's share of the one shared
+    # link's gradient — before the all-reduce sums the stages together.
+    _param_link_key = None
+    _param_link_module = None
+    for _key, _mod, _owner in (("12", outer_12, rp), ("23", outer_23, rc), ("31", outer_31, rs)):
+        if rank == _owner and (_mod is not None or shared_link is not None):
+            _param_link_key = _key
+            _param_link_module = _mod if _mod is not None else shared_link
+            break
+    param_tracker = LinkParamGradTracker(_param_link_module)
+    if _param_link_key is None and rank == 0:
+        print("[grad] no local link module; per-round parameter gradients disabled.")
+
+    # Shared modes: one module serves all three transitions, and each rank's
+    # backward only touches the slice its own stage uses.  The module's true
+    # per-round gradient is therefore the SUM over the three stages — and norms
+    # are not additive, so it has to be summed as a vector.  Accumulate each
+    # round's delta locally across micro-batches, then one all-reduce per step
+    # (n_rounds rows at once) recovers it.  Costs one extra collective per step
+    # on top of the optimizer's, and n_rounds x |link| of fp32 GPU memory.
+    _shared_total = None
+    if shared_link is not None and pipeline and sync_params:
+        _n_flat = sum(p.numel() for p in sync_params)
+        _shared_total = torch.zeros(cfg.n_rounds, _n_flat,
+                                    device=device, dtype=torch.float32)
+        if rank == 0:
+            print(f"[grad] shared-link per-round accumulator: {cfg.n_rounds} x {_n_flat:,} "
+                  f"fp32 ({cfg.n_rounds * _n_flat * 4 / 2**20:.0f} MiB)")
 
     B          = cfg.batch_size
     grad_accum = max(1, getattr(cfg, "grad_accum", 1))
@@ -1555,16 +1851,36 @@ def run_training(cfg, device: torch.device, mode: str = "original",
         return torch.zeros(shape, dtype=dt, device=dev)
 
     _ckpt_suffix = ""
-    if mode == "shared_roae":
+    if mode in SHARED_MODES:
         _ckpt_suffix = "_skip" if use_round_skip else "_noskip"
 
     import datetime as _dt
     _run_ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # This run's output directory.  Derived exactly like save_checkpoint's
+    # parent_dir so a run's figures land beside its own checkpoints instead of
+    # in the project root, where a later run with the same (mode, n_rounds)
+    # would silently overwrite them.
+    _run_dir = (THIS_DIR / "outputs" / "checkpoints" /
+                f"{getattr(cfg, 'out_prefix', 'outerlink_grad')}_{mode}"
+                f"_r{cfg.n_rounds}{_ckpt_suffix}_{_run_ts}")
+
+    ckpt_dir = None   # set by the first save_checkpoint below
+
+    if _wandb_meta is not None and rank == 0:
+        _run_dir.mkdir(parents=True, exist_ok=True)
+        with open(_run_dir / "wandb_run.json", "w") as _f:
+            json.dump(_wandb_meta, _f, indent=2)
+        print(f"[wandb] run {_wandb_meta['id']} → {_run_dir / 'wandb_run.json'}")
+
     for step in range(start_step, cfg.steps):
 
         if optimizer is not None:
-            optimizer.zero_grad()
+            # set_to_none=False: the all-reduce below flattens a fixed parameter
+            # list, so the .grad buffers must stay allocated (and zeroed) even for
+            # parameters this rank's backward never touches.  set_to_none=True
+            # would drop them and reintroduce the per-rank layout mismatch.
+            optimizer.zero_grad(set_to_none=False)
 
         _accum_loss_scalars: List[float] = []
 
@@ -1581,6 +1897,8 @@ def run_training(cfg, device: torch.device, mode: str = "original",
             # highway into every subsequent round.  Detached so it acts as a fixed
             # anchor; beta (on SharedRecursiveLink) learns the blend weight.
             initial_feedback = None
+            # shared_state: recursive state z threaded across rounds (rank rs only).
+            round_state = None
             rounds = []
 
             for r in range(cfg.n_rounds):
@@ -1599,8 +1917,11 @@ def run_training(cfg, device: torch.device, mode: str = "original",
                     round_idx=r,
                     shared_link=shared_link,
                     is_last_round=(r == cfg.n_rounds - 1),
+                    round_state=round_state,
                 )
                 rounds.append(out)
+                if rank == rs:
+                    round_state = out.get("round_state", round_state)
 
                 if r < cfg.n_rounds - 1:
                     if pipeline and rs != rp:
@@ -1640,6 +1961,12 @@ def run_training(cfg, device: torch.device, mode: str = "original",
                 for r in range(cfg.n_rounds - 1, -1, -1):
                     o = rounds[r]
                     is_last_backward = (r == 0)
+
+                    # Everything this rank's link accumulates between here and the
+                    # end of the iteration is round r's contribution, and nothing
+                    # else: the graph is cut at the received tensors, so no other
+                    # round's activations are reachable from this stage.
+                    param_tracker.snapshot()
 
                     # Step A ── rs: backward through local solver graph ────────
                     if rank == rs:
@@ -1691,6 +2018,14 @@ def run_training(cfg, device: torch.device, mode: str = "original",
                             o["g_fb_for_prev"] = _recv_tensor(src=rp, device=device, dtype=dtype,
                                                               shape=(B, cfg.latent_steps, PLANNER_DIM))
 
+                    # Round r's backward stage is complete on every rank; Step D
+                    # only moved gradients between ranks and touched no weights.
+                    if monitor is not None and _param_link_key is not None:
+                        monitor.record_param_delta(_param_link_key, r,
+                                                   param_tracker.delta_norm())
+                    if _shared_total is not None:
+                        param_tracker.delta_into(_shared_total[r])
+
             # Track the unscaled loss scalar for logging (multiply back by grad_accum).
             _accum_loss_scalars.append(
                 (loss.item() * grad_accum) if loss is not None else float("nan")
@@ -1718,46 +2053,130 @@ def run_training(cfg, device: torch.device, mode: str = "original",
         _barrier()
 
         # Flattened allreduce for SharedRecursiveLink.
-        if _is_dist() and shared_link is not None:
-            grads = [p.grad for p in local_params if p.grad is not None]
-            if grads:
-                flat = torch.cat([g.reshape(-1) for g in grads])
-                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-                flat.div_(world)
-                offset = 0
-                for p in local_params:
-                    if p.grad is not None:
-                        n = p.grad.numel()
-                        p.grad.copy_(flat[offset:offset + n].reshape(p.grad.shape))
-                        offset += n
+        #
+        # Every rank holds a full replica of the shared link, but this is PIPELINE
+        # parallelism: each rank's backward only reaches the projections used by
+        # its own transition (planner: in_proj.1/skip_proj.1/out_proj.2; critic:
+        # in_proj.2/skip_proj.2/out_proj.3; solver: in_proj.3/skip_proj.3/
+        # out_proj.1/gamma), plus the truly shared expert/router/ln/alpha weights.
+        # Selecting the buffer by `p.grad is not None` therefore produced a
+        # DIFFERENT parameter list per rank — different order and different total
+        # length (8,404,992 / 7,880,192 / 7,356,417 elements for the three stages
+        # at hidden_dims=[2048,2048,1536], shared_dim=1024).  Only the leading
+        # expert/alpha slots lined up; everything after was summed against an
+        # unrelated tensor, and the length mismatch made the collective itself
+        # undefined.  `gamma` in particular sat opposite in_proj.1.weight and so
+        # never received its own gradient — it stayed pinned at its ReZero init.
+        #
+        # Iterating `sync_params` (fixed, rank-independent, grads pre-materialised)
+        # keeps slot k on the same parameter everywhere.  It also means every rank
+        # steps every parameter, so the replicas stay identical — previously each
+        # rank only updated the subset it had gradients for and they drifted apart.
+        if _is_dist() and sync_params:
+            flat = torch.cat([p.grad.reshape(-1) for p in sync_params])
+            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+            # Pipeline stages hold partial derivatives of the SAME loss, so the
+            # sum is the true gradient.  Keeping the /world scaling preserves the
+            # historical update magnitude; it is a uniform rescaling that Adam is
+            # invariant to, so it does not change training.
+            flat.div_(world)
+            offset = 0
+            for p in sync_params:
+                n = p.grad.numel()
+                p.grad.copy_(flat[offset:offset + n].reshape(p.grad.shape))
+                offset += n
 
         if optimizer is not None:
             torch.nn.utils.clip_grad_norm_(local_params, max_norm=1.0)
             optimizer.step()
             scheduler.step()
+            # shared_tied: keep S on the Stiefel manifold — without this, singular
+            # values drift above 1 and the 48x rollout self-loop overflows bf16.
+            if isinstance(shared_link, SharedRecursiveTiedLink):
+                shared_link.re_orthonormalize_()
 
         # ── Logging ──────────────────────────────────────────────────────────
-        if rank == rp and monitor is not None:
-            monitor.commit_step()
+        # Sum the three stages' per-round contributions into the shared link's
+        # whole-module gradient.  Done before commit_step so it lands in this
+        # step's slot, and unconditionally on every rank so the collective stays
+        # balanced.  One value per round per step, so commit_step's division by
+        # grad_accum applies the same scaling the other series carry.
+        if _shared_total is not None:
+            dist.all_reduce(_shared_total, op=dist.ReduceOp.SUM)
+            if monitor is not None:
+                for r in range(cfg.n_rounds):
+                    monitor.record_param_delta("shared", r,
+                                               float(_shared_total[r].norm().item()))
+            _shared_total.zero_()
+
+        if monitor is not None:
+            monitor.commit_step(n_microbatches=grad_accum)
         if _is_dist():
             _sync_norms_all_ranks(monitor, cfg.n_rounds)
 
         if rank == 0:
             losses.append(step_loss)
 
+        # Per-link, per-round gradient norms — logged EVERY step.  The question
+        # these answer ("how does each link's gradient evolve across rounds as
+        # training proceeds") is a time series, and the console cadence below
+        # would give it ten points over a 3000-step run.  Two families:
+        #   grad_norm/<link>/round_<r>        gradient at the link's output
+        #   grad_norm_param/<link>/round_<r>  gradient at the link's weights
+        wb_grad_norms = {}
+        if rank == 0 and monitor is not None:
+            for link in GradMonitor.LINKS:
+                for store, prefix in ((monitor.norms, "grad_norm"),
+                                      (monitor.param_norms, "grad_norm_param")):
+                    for r in range(cfg.n_rounds):
+                        hist = store[link][r]
+                        if hist and not math.isnan(hist[-1]):
+                            wb_grad_norms[f"{prefix}/{link}/round_{r + 1}"] = hist[-1]
+
+        if use_wandb:
+            wandb.log({"train/loss": step_loss,
+                       "train/lr": scheduler.get_last_lr()[0]
+                       if scheduler is not None else cfg.lr,
+                       **wb_grad_norms}, step=step)
+
         log_this_step = (step % max(1, cfg.steps // 10) == 0 or step == cfg.steps - 1)
 
         if log_this_step:
             if rank == 0:
-                if monitor is not None and monitor.norms[0]:
-                    norms_str = "  ".join(
-                        f"r{r+1}:{monitor.norms[r][-1]:.3e}"
-                        for r in range(cfg.n_rounds)
-                    )
-                    print(f"  step {step:4d}  loss={step_loss:.4f}"
-                          f"  grad_norms [{norms_str}]")
-                else:
-                    print(f"  step {step:4d}  loss={step_loss:.4f}")
+                gate_str = ""
+                wb_gates = {}
+                if shared_link is not None:
+                    alpha_v = shared_link.alpha.item()
+                    beta_v = shared_link.beta.item()
+                    gate_str = f"  alpha={alpha_v:.2e} beta={beta_v:.2e}"
+                    wb_gates = {"gates/alpha": alpha_v, "gates/beta": beta_v}
+                    if isinstance(shared_link, SharedRecursiveStateLink):
+                        gamma_v = shared_link.gamma.item()
+                        gate_str += f" gamma={gamma_v:.2e}"
+                        wb_gates["gates/gamma"] = gamma_v
+                    if isinstance(shared_link, SharedRecursiveTiedLink):
+                        smax_v = shared_link.max_singular_value()
+                        gate_str += f" smax={smax_v:.4f}"
+                        wb_gates["gates/max_singular_value"] = smax_v
+                print(f"  step {step:4d}  loss={step_loss:.4f}{gate_str}")
+
+                if monitor is not None:
+                    for tag, store in (("act", monitor.norms), ("prm", monitor.param_norms)):
+                        for link in GradMonitor.LINKS:
+                            per_round = store[link]
+                            if not any(per_round[r] and not math.isnan(per_round[r][-1])
+                                       for r in range(cfg.n_rounds)):
+                                continue  # link not active in this mode
+                            norms_str = "  ".join(
+                                f"r{r+1}:{per_round[r][-1]:.3e}"
+                                if per_round[r] and not math.isnan(per_round[r][-1])
+                                else f"r{r+1}:--"
+                                for r in range(cfg.n_rounds)
+                            )
+                            print(f"           grad[{tag}][{link:>5s}] [{norms_str}]")
+
+                if use_wandb and wb_gates:
+                    wandb.log(wb_gates, step=step)
 
         # ── Mid-training checkpoint ───────────────────────────────────────────
         is_last_step = (step == cfg.steps - 1)
@@ -1780,13 +2199,15 @@ def run_training(cfg, device: torch.device, mode: str = "original",
             )
             if rank == 0 and ckpt_dir is not None:
                 print(f"  [ckpt] step {step + 1}  →  {ckpt_dir}")
+                if use_wandb:
+                    wandb.log({"checkpoint/step": step + 1}, step=step)
 
     # Gather results: collect norm history from rank_planner to rank 0
     if _is_dist() and rp != 0:
         # rank_planner serialises norms and sends to rank 0
         import pickle
         if rank == rp:
-            blob = pickle.dumps(monitor.norms)
+            blob = pickle.dumps((monitor.norms, monitor.param_norms))
             size = torch.tensor([len(blob)], dtype=torch.long, device=device)
             dist.send(size, dst=0)
             data = torch.frombuffer(bytearray(blob), dtype=torch.uint8).to(device)
@@ -1797,9 +2218,11 @@ def run_training(cfg, device: torch.device, mode: str = "original",
             data = torch.zeros(size.item(), dtype=torch.uint8, device=device)
             dist.recv(data, src=rp)
             import pickle
-            grad_norms = pickle.loads(bytes(data.cpu().numpy()))
+            grad_norms, grad_norms_param = pickle.loads(bytes(data.cpu().numpy()))
     else:
-        grad_norms = monitor.norms if monitor is not None else {r: [] for r in range(cfg.n_rounds)}
+        _empty = {l: {r: [] for r in range(cfg.n_rounds)} for l in GradMonitor.LINKS}
+        grad_norms       = monitor.norms       if monitor is not None else _empty
+        grad_norms_param = monitor.param_norms if monitor is not None else copy.deepcopy(_empty)
 
     # ── Free this run's models/optimizer before returning ────────────────────
     # `compare` mode calls run_training twice in the same process (original,
@@ -1814,8 +2237,32 @@ def run_training(cfg, device: torch.device, mode: str = "original",
     gc.collect()
     torch.cuda.empty_cache()
 
-    return {"losses": losses, "grad_norms_per_round": grad_norms,
-            "checkpoint_dir": str(ckpt_dir) if ckpt_dir else None}
+    if use_wandb:
+        # The scalar series are the data; these are the figures a person actually
+        # reads — one panel per link, one curve per round.  Logging them into the
+        # run keeps the plot next to the numbers that produced it instead of in a
+        # PNG somewhere on the cluster filesystem.  Done here, before finish(),
+        # because `compare`/`sweep` open a fresh run for the next mode.
+        try:
+            _fig_res = {"losses": losses,
+                        "grad_norms_per_link": grad_norms,
+                        "grad_norms_per_link_param": grad_norms_param}
+            for _store, _key in (("act", "grad/per_link_activation"),
+                                 ("param", "grad/per_link_parameter")):
+                _fp = Path(_run_dir) / f"per_link_grad_{_store}.png"
+                plot_links(_fig_res, cfg, [_fp], store=_store)
+                wandb.log({_key: wandb.Image(str(_fp))})
+        except Exception as _e:                       # never lose a run to a plot
+            print(f"[wandb] figure logging skipped: {type(_e).__name__}: {_e}")
+        wandb.finish()
+
+    # grad_norms_per_round keeps the legacy meaning (planner→critic link "12")
+    # for existing plots; grad_norms_per_link carries every inter-link.
+    return {"losses": losses, "grad_norms_per_round": grad_norms["12"],
+            "grad_norms_per_link": grad_norms,
+            "grad_norms_per_link_param": grad_norms_param,
+            "checkpoint_dir": str(ckpt_dir) if ckpt_dir else None,
+            "run_dir": str(_run_dir)}
 
 
 # ── Checkpoint saving ─────────────────────────────────────────────────────────
@@ -1997,7 +2444,7 @@ def save_checkpoint(
             with open(ckpt_dir / "outerlink_config.json", "w") as f:
                 _json.dump(manifest, f, indent=2)
 
-        elif mode == "shared_roae":
+        elif mode in SHARED_MODES:
             if sd_shared:
                 torch.save(sd_shared, ckpt_dir / "shared_recursive_link.pt")
                 # Store architecture hyperparams alongside the weights so run.py
@@ -2007,7 +2454,7 @@ def save_checkpoint(
                     "shared_dim":  shared_link.shared_dim  if shared_link is not None else 512,
                     "n_experts":   shared_link.n_experts   if shared_link is not None else getattr(cfg, "n_experts", 4),
                     "expert_dim_divisor": getattr(cfg, "expert_dim_divisor", 4),
-                    "adapter_type": "shared_recursive_link",
+                    "adapter_type": SHARED_ADAPTER_TYPE.get(mode, "shared_recursive_link"),
                 }
                 with open(ckpt_dir / "shared_roae_config.json", "w") as f:
                     _json.dump(config, f, indent=2)
@@ -2071,12 +2518,73 @@ def analyse(results: Dict, cfg) -> None:
         )
         print(f"\n  Ratio round-1 / round-{n_rounds}: {ratio:.4f}  →  {verdict}")
 
+    # Per-link stability: every inter-link (12/23/31 and, in shared_state mode,
+    # the recursive-state path z).  Ratio uses the earliest and latest rounds
+    # that actually carry gradients ("31"/"state" have none on the final round).
+    for _store_key, _store_label in (
+            ("grad_norms_per_link",       "activation gradient ||dL/dy||"),
+            ("grad_norms_per_link_param", "parameter gradient  ||dL/dW||"),
+    ):
+        _analyse_per_link(results.get(_store_key), _store_label, n_rounds, tail)
+
     loss_tail = results["losses"][-tail:]
     print(f"  Loss (last {tail} steps):  mean={np.mean(loss_tail):.4f}"
           f"  std={np.std(loss_tail):.4f}")
 
 
-def plot_single(results: Dict, cfg, out_path: str) -> None:
+def _analyse_per_link(per_link, label: str, n_rounds: int, tail: int) -> None:
+    """Print one gradient store's per-round profile, one line per link."""
+    if per_link:
+        print(f"\n  Per-link {label}  (last {tail} steps):")
+        for link, per_round in per_link.items():
+            link_avg = {}
+            for r in range(n_rounds):
+                vals = [v for v in per_round.get(r, [])[-tail:] if not math.isnan(v)]
+                if vals:
+                    link_avg[r] = float(np.mean(vals))
+            if not link_avg:
+                continue  # link not active in this mode
+            rounds_str = "  ".join(f"r{r+1}:{link_avg[r]:.3e}" for r in sorted(link_avg))
+            if len(link_avg) >= 2:
+                lo, hi = min(link_avg), max(link_avg)
+                lratio = link_avg[lo] / (link_avg[hi] + 1e-12)
+                lverdict = ("VANISHING" if lratio < 0.1 else
+                            "EXPLODING" if lratio > 10 else "stable")
+                print(f"    link {link:>5s}:  {rounds_str}   ratio r{lo+1}/r{hi+1}={lratio:.4f} [{lverdict}]")
+            else:
+                print(f"    link {link:>5s}:  {rounds_str}")
+
+
+# ── Figure output paths ──────────────────────────────────────────────────────
+
+def figure_paths(filename: str, *results_dicts) -> List[Path]:
+    """Destinations for a figure: one per participating run's output directory.
+
+    A figure describing N runs is written into each of their directories, so it
+    sits beside the checkpoints it describes no matter which run you open.
+    Falls back to the project root if no run reported a directory, so a figure
+    is never silently dropped.
+    """
+    dirs: List[str] = []
+    for res in results_dicts:
+        d = (res or {}).get("run_dir")
+        if d and d not in dirs:
+            dirs.append(d)
+    if not dirs:
+        return [THIS_DIR / filename]
+    return [Path(d) / filename for d in dirs]
+
+
+def _save_figure(fig, out_paths, label: str = "Plot") -> None:
+    """Write one rendered figure to every destination."""
+    for out in out_paths:
+        out = Path(out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"{label} saved → {out}")
+
+
+def plot_single(results: Dict, cfg, out_paths) -> None:
     n_rounds = cfg.n_rounds
     tail     = max(1, cfg.steps // 5)
     cmap     = plt.get_cmap("plasma")
@@ -2128,11 +2636,130 @@ def plot_single(results: Dict, cfg, out_path: str) -> None:
     ax.set_xticks(range(1, n_rounds + 1))
 
     plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"\nPlot saved → {out_path}")
+    _save_figure(fig, out_paths, "Plot")
+    plt.close(fig)
 
 
-def plot_sweep(sweep_results: List[Tuple[int, Dict]], out_path: str) -> None:
+# Human-readable names for the inter-agent links tracked by GradMonitor.
+LINK_LABELS = {
+    "12":    "Planner → Critic  (1→2)",
+    "23":    "Critic → Solver   (2→3)",
+    "31":    "Solver → Planner  (3→1)",
+    "state": "Recursive state z (shared_state)",
+    "shared": "Shared link, all stages (shared_* modes)",
+}
+
+
+def plot_links(results: Dict, cfg, out_paths, store: str = "act") -> None:
+    """Per-link gradient profile: every inter-agent link at every round.
+
+    plot_single only shows link "12".  This figure shows each link's per-round
+    gradient trace plus a grouped bar chart of the final averages, so the
+    1→2 / 2→3 / 3→1 links can be compared round by round.
+
+    `store` selects which gradient is plotted:
+      "act"   — the gradient arriving at the link's output activation
+      "param" — the gradient arriving at the link's weights, summed over the
+                whole module.  This is the one the optimizer consumes, and the
+                one to read when asking whether a round is training the link.
+    """
+    n_rounds = cfg.n_rounds
+    tail     = max(1, cfg.steps // 5)
+    cmap     = plt.get_cmap("plasma")
+    key      = "grad_norms_per_link_param" if store == "param" else "grad_norms_per_link"
+    per_link = results.get(key) or {}
+    what     = ("parameter gradient  ||dL/dW||" if store == "param"
+                else "activation gradient  ||dL/dy||")
+
+    def _avg(vals):
+        v = [x for x in vals[-tail:] if not math.isnan(x)]
+        return float(np.mean(v)) if v else float("nan")
+
+    # Keep only links that carry gradient in this mode.
+    active = []
+    for link in GradMonitor.LINKS:
+        rounds = per_link.get(link) or {}
+        if any(rounds.get(r) and not math.isnan(_avg(rounds[r]))
+               for r in range(n_rounds)):
+            active.append(link)
+    if not active:
+        print(f"plot_links[{store}]: no link carried gradient; nothing to plot.")
+        return
+
+    n_panels = len(active) + 2                      # loss + per-link + summary bar
+    ncols    = min(3, n_panels)
+    nrows    = math.ceil(n_panels / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.6 * ncols, 4.2 * nrows),
+                             squeeze=False)
+    flat = [ax for row in axes for ax in row]
+
+    mode_tag = getattr(cfg, "mode", "")
+    if isinstance(mode_tag, (list, tuple)):
+        mode_tag = mode_tag[0]
+    fig.suptitle(
+        f"RecursiveMAS-Light  |  per-link {what}  by recursion round\n"
+        f"mode={mode_tag}  n_rounds={n_rounds}  latent_steps={cfg.latent_steps}  "
+        f"steps={cfg.steps}  lr={cfg.lr}  world={_world()}",
+        fontsize=11,
+    )
+
+    # ── Panel 0: loss ────────────────────────────────────────────────────────
+    ax = flat[0]
+    losses = results["losses"]
+    w = max(1, len(losses) // 20)
+    ax.plot(losses, alpha=0.35, color="steelblue", linewidth=0.8)
+    if len(losses) >= w:
+        ax.plot(range(w - 1, len(losses)),
+                np.convolve(losses, np.ones(w) / w, mode="valid"),
+                color="steelblue", linewidth=2)
+    ax.set_xlabel("Step"); ax.set_ylabel("CE loss")
+    ax.set_title("Training loss"); ax.grid(True, alpha=0.3)
+
+    # ── One panel per link: all rounds over time ─────────────────────────────
+    for i, link in enumerate(active):
+        ax = flat[1 + i]
+        rounds = per_link[link]
+        for r in range(n_rounds):
+            vals = rounds.get(r) or []
+            vals = [v for v in vals if not math.isnan(v)]
+            if not vals:
+                continue                       # e.g. 31/state on the final round
+            ax.plot(vals, color=cmap(r / max(1, n_rounds - 1)),
+                    linewidth=1.1, label=f"Round {r + 1}")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("||dL/dW||" if store == "param" else "||dL/dy||")
+        ax.set_title(LINK_LABELS.get(link, link), fontsize=10)
+        ax.set_yscale("log"); ax.grid(True, alpha=0.3); ax.legend(fontsize=7)
+
+    # ── Final panel: grouped bars, round on x, one bar per link ──────────────
+    ax = flat[1 + len(active)]
+    width = 0.8 / len(active)
+    link_colors = plt.get_cmap("tab10")
+    for i, link in enumerate(active):
+        rounds = per_link[link]
+        vals, xs = [], []
+        for r in range(n_rounds):
+            a = _avg(rounds.get(r) or [float("nan")])
+            if not math.isnan(a):
+                xs.append(r + 1 + (i - (len(active) - 1) / 2) * width)
+                vals.append(a)
+        ax.bar(xs, vals, width=width, label=LINK_LABELS.get(link, link).split("  ")[0],
+               color=link_colors(i), edgecolor="black", linewidth=0.4, alpha=0.9)
+    ax.set_xlabel("Round")
+    ax.set_ylabel("Avg " + ("||dL/dW||" if store == "param" else "||dL/dy||"))
+    ax.set_title(f"Avg per link × round (last {tail} steps)", fontsize=10)
+    ax.set_yscale("log"); ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xticks(range(1, n_rounds + 1)); ax.legend(fontsize=7)
+
+    for ax in flat[n_panels:]:
+        ax.axis("off")
+
+    plt.tight_layout()
+    _save_figure(fig, out_paths, f"Per-link plot [{store}]")
+    plt.close(fig)
+
+
+def plot_sweep(sweep_results: List[Tuple[int, Dict]], out_paths) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     fig.suptitle("Sweep: gradient stability vs recursion depth  "
                  "(RecursiveMAS-Light, MATH-500)")
@@ -2165,8 +2792,8 @@ def plot_sweep(sweep_results: List[Tuple[int, Dict]], out_path: str) -> None:
     ax.grid(True, axis="y", alpha=0.3); ax.set_xticks(round_counts)
 
     plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"\nSweep plot saved → {out_path}")
+    _save_figure(fig, out_paths, "Sweep plot")
+    plt.close(fig)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -2199,10 +2826,24 @@ def parse_args():
     p.add_argument("--out_prefix", type=str, default="outerlink_grad")
     p.add_argument("--dtype", type=str, default="bfloat16",
                    choices=["bfloat16", "float16", "float32"])
+    p.add_argument("--link_dtype", type=str, default="float32",
+                   choices=["bfloat16", "float16", "float32", "same"],
+                   help="dtype for the TRAINED link only; the frozen backbones stay "
+                        "at --dtype.  Defaults to float32: the link accumulates one "
+                        "gradient contribution per round into one .grad buffer, and "
+                        "those span 5-6 orders of magnitude, so bfloat16 addition "
+                        "(eps 7.8e-3) discards most of the early rounds before the "
+                        "optimizer sees them.  'same' reproduces the old behaviour.")
     p.add_argument("--mode", type=str, default="original",
-                   choices=["original", "shared_roae", "compare", "compare_roundskip"],
+                   choices=["original", "shared_roae", "shared_state", "shared_tied",
+                            "compare", "compare_roundskip"],
                    help="original: independent CrossModelAdapters (default); "
                         "shared_roae: single SharedRecursiveLink with MoE + RoAE; "
+                        "shared_state: SharedRecursiveStateLink — shared_roae plus a "
+                        "residual recursive state z bypassing each full round "
+                        "(z' = z + gamma*F(z), gamma ReZero-init); "
+                        "shared_tied: SharedRecursiveTiedLink — shared_roae with tied "
+                        "decoders O_i = S_i^T (semi-orthogonal round trips at init); "
                         "compare: run both and plot side-by-side; "
                         "compare_roundskip: shared_roae with vs without round-skip ablation.")
     p.add_argument("--n_experts", type=int, default=4,
@@ -2221,10 +2862,25 @@ def parse_args():
                    help="Enable gradient checkpointing to trade compute for activation memory.")
     p.add_argument("--grad_accum", type=int, default=1,
                    help="Gradient accumulation steps. Effective batch = batch_size * grad_accum.")
+    p.add_argument("--wandb", action="store_true", default=False,
+                   help="Log training dynamics (loss, per-link grad norms, gate values, "
+                        "hyperparameters) to Weights & Biases. One run per (mode, n_rounds) "
+                        "combination, logged from the planner rank only.")
+    p.add_argument("--wandb_project", type=str, default="recursivemas-outerlinks",
+                   help="W&B project name.")
+    p.add_argument("--wandb_entity", type=str, default="",
+                   help="W&B entity (team/user). Empty = your default entity.")
+    p.add_argument("--wandb_run_name", type=str, default="",
+                   help="W&B run name. Empty = auto-generated from mode/n_rounds/timestamp.")
+    p.add_argument("--wandb_mode", type=str, default="offline",
+                   choices=["online", "offline", "disabled"],
+                   help="W&B mode. 'offline' (default) writes locally for later "
+                        "`wandb sync` — compute nodes here have no internet. "
+                        "'online' requires WANDB_API_KEY and network access.")
     return p.parse_args()
 
 
-def plot_compare(results_orig: Dict, results_shared: Dict, cfg, out_path: str,
+def plot_compare(results_orig: Dict, results_shared: Dict, cfg, out_paths,
                  label_a: str = "Original (CrossModelAdapter)",
                  label_b: str = "SharedLink-RoAE (MoE+RoPE)",
                  title_tag: str = "Original vs SharedLink-RoAE") -> None:
@@ -2315,8 +2971,8 @@ def plot_compare(results_orig: Dict, results_shared: Dict, cfg, out_path: str,
     ax.set_yscale("log"); ax.legend(fontsize=7); ax.grid(True, axis="y", alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"\nComparison plot saved → {out_path}")
+    _save_figure(fig, out_paths, "Comparison plot")
+    plt.close(fig)
 
 
 def _print_compare_summary(results_orig: Dict, results_shared: Dict, cfg,
@@ -2388,8 +3044,9 @@ def main():
                 analyse(results_orig,   cfg)
                 analyse(results_shared, cfg)
                 _print_compare_summary(results_orig, results_shared, cfg)
-                out = f"{cfg.out_prefix}_compare_r{cfg.n_rounds}.png"
-                plot_compare(results_orig, results_shared, cfg, out_path=out)
+                out = figure_paths(f"{cfg.out_prefix}_compare_r{cfg.n_rounds}.png",
+                                   results_orig, results_shared)
+                plot_compare(results_orig, results_shared, cfg, out_paths=out)
         else:
             for n in round_list:
                 if rank == 0:
@@ -2400,7 +3057,9 @@ def main():
                 if rank == 0:
                     _print_compare_summary(r_orig, r_shared, cfg_n)
                     plot_compare(r_orig, r_shared, cfg_n,
-                                 out_path=f"{cfg.out_prefix}_compare_r{n}.png")
+                                 out_paths=figure_paths(
+                                     f"{cfg.out_prefix}_compare_r{n}.png",
+                                     r_orig, r_shared))
 
     elif mode == "compare_roundskip":
         # Ablation: SharedRecursiveLink with vs without round-skip (beta gate).
@@ -2419,8 +3078,9 @@ def main():
                 analyse(results_noskip, cfg)
                 _print_compare_summary(results_skip, results_noskip, cfg,
                                        label_a=_LA, label_b=_LB)
-                out = f"{cfg.out_prefix}_roundskip_r{cfg.n_rounds}.png"
-                plot_compare(results_skip, results_noskip, cfg, out_path=out,
+                out = figure_paths(f"{cfg.out_prefix}_roundskip_r{cfg.n_rounds}.png",
+                                   results_skip, results_noskip)
+                plot_compare(results_skip, results_noskip, cfg, out_paths=out,
                              label_a=_LA, label_b=_LB,
                              title_tag="SharedLink: Round-Skip vs No-Skip")
         else:
@@ -2434,7 +3094,9 @@ def main():
                     _print_compare_summary(r_skip, r_noskip, cfg_n,
                                            label_a=_LA, label_b=_LB)
                     plot_compare(r_skip, r_noskip, cfg_n,
-                                 out_path=f"{cfg.out_prefix}_roundskip_r{n}.png",
+                                 out_paths=figure_paths(
+                                     f"{cfg.out_prefix}_roundskip_r{n}.png",
+                                     r_skip, r_noskip),
                                  label_a=_LA, label_b=_LB,
                                  title_tag="SharedLink: Round-Skip vs No-Skip")
 
@@ -2444,7 +3106,14 @@ def main():
         if rank == 0:
             analyse(results, cfg)
             plot_single(results, cfg,
-                        out_path=f"{cfg.out_prefix}_{mode}_r{cfg.n_rounds}.png")
+                        out_paths=figure_paths(
+                            f"{cfg.out_prefix}_{mode}_r{cfg.n_rounds}.png", results))
+            plot_links(results, cfg,
+                       out_paths=figure_paths(
+                           f"{cfg.out_prefix}_{mode}_r{cfg.n_rounds}_links.png", results))
+            plot_links(results, cfg, store="param",
+                       out_paths=figure_paths(
+                           f"{cfg.out_prefix}_{mode}_r{cfg.n_rounds}_links_param.png", results))
     else:
         sweep_results = []
         for n in round_list:
@@ -2453,7 +3122,14 @@ def main():
             if rank == 0:
                 analyse(results, cfg_n)
                 plot_single(results, cfg_n,
-                            out_path=f"{cfg.out_prefix}_{mode}_r{n}.png")
+                            out_paths=figure_paths(
+                                f"{cfg.out_prefix}_{mode}_r{n}.png", results))
+                plot_links(results, cfg_n,
+                           out_paths=figure_paths(
+                               f"{cfg.out_prefix}_{mode}_r{n}_links.png", results))
+                plot_links(results, cfg_n, store="param",
+                           out_paths=figure_paths(
+                               f"{cfg.out_prefix}_{mode}_r{n}_links_param.png", results))
             sweep_results.append((n, results))
 
         if rank == 0:
@@ -2472,7 +3148,9 @@ def main():
                 verd  = ("VANISHING" if ratio < 0.1 else
                          "EXPLODING" if ratio > 10   else "STABLE")
                 print(f"  {n:>6}  {ratio:>10.4f}  {avg_l:>8.4f}  {verd}")
-            plot_sweep(sweep_results, out_path=f"{cfg.out_prefix}_{mode}_sweep.png")
+            plot_sweep(sweep_results,
+                       out_paths=figure_paths(f"{cfg.out_prefix}_{mode}_sweep.png",
+                                              *[r for _, r in sweep_results]))
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()

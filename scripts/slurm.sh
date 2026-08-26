@@ -117,6 +117,14 @@ EOF
     cat >> "$s" << 'SLURM_EOF'
 export SRUN_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"
 export PYTHONUNBUFFERED=1
+# Sanitize env inherited from the submitting shell (e.g. a stray micromamba/conda
+# env's PYTHONPATH, or a leftover HF_DATASETS_CACHE/HF_HUB_CACHE from a
+# different project's session) so it can't shadow the project venv's own
+# torch install or this project's HF cache set below.
+unset PYTHONPATH PYTHONHOME CONDA_PREFIX CONDA_DEFAULT_ENV MAMBA_ROOT_PREFIX
+unset HF_DATASETS_CACHE HF_HUB_CACHE
+# Use the project venv if available regardless of the submission shell's environment.
+[[ -f /p/project1/hai_1354/recursiveMAS_env/bin/activate ]] && source /p/project1/hai_1354/recursiveMAS_env/bin/activate
 export MASTER_PORT=$((10000 + RANDOM % 20000))
 _TRITON_SCRATCH="/p/scratch/spare-ml/zhou17/.triton/autotune"
 if mkdir -p "${_TRITON_SCRATCH}" 2>/dev/null; then
@@ -240,6 +248,14 @@ EOF
     cat >> "$s" << 'SLURM_EOF'
 export OMP_NUM_THREADS=1
 export SRUN_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"
+# Sanitize env inherited from the submitting shell (e.g. a stray micromamba/conda
+# env's PYTHONPATH, or a leftover HF_DATASETS_CACHE/HF_HUB_CACHE from a
+# different project's session) so it can't shadow the project venv's own
+# torch install or this project's HF cache set below.
+unset PYTHONPATH PYTHONHOME CONDA_PREFIX CONDA_DEFAULT_ENV MAMBA_ROOT_PREFIX
+unset HF_DATASETS_CACHE HF_HUB_CACHE
+# Use the project venv regardless of the submission shell's environment.
+source /p/project1/hai_1354/recursiveMAS_env/bin/activate
 SLURM_EOF
 
     # ── Inject submit-time values ─────────────────────────────────────────────

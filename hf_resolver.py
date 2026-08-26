@@ -50,7 +50,14 @@ def resolve_outer_paths(outer_dir: Path, *, task: Optional[str]) -> Dict[str, Pa
     if "tasks" in data:
         if task is None:
             raise ValueError(f"Task must be set for task-scoped outer manifest: {outer_dir}")
-        adapters = data["tasks"][task].get("adapters", [])
+        tasks = data["tasks"]
+        if task not in tasks and len(tasks) == 1:
+            # Locally trained checkpoints save a single adapter set labeled by
+            # their training task; use it for any requested task.
+            fallback = next(iter(tasks))
+            print(f"[outer] task {task!r} not in manifest {manifest}; using {fallback!r} adapters.")
+            task = fallback
+        adapters = tasks[task].get("adapters", [])
     else:
         adapters = data.get("adapters", [])
     out: Dict[str, Path] = {}
@@ -64,7 +71,12 @@ def resolve_outer_paths(outer_dir: Path, *, task: Optional[str]) -> Dict[str, Pa
 
 def infer_adapter_task_for_dataset(dataset: str) -> str:
     key = str(dataset or "").strip().lower()
-    if key in {"mbppplus", "evalplus/mbppplus"}:
+    if key in {
+        "mbppplus", "mbpp+", "evalplus/mbppplus",
+        "livecodebench", "livecodebench_v6",
+        "livecodebench/code_generation_lite",
+        "livecodebench/code_generation_lite:release_v6",
+    }:
         return "code"
     return "math"
 
