@@ -49,6 +49,7 @@ from .answer_utils import (
     truncate_text_chars,
 )
 from prompts import (
+    SELF_INJECT_LABEL,
     FEEDBACK_SLOT,
     PLANNER_SLOT,
     REFINED_SLOT,
@@ -978,12 +979,6 @@ def run_outer_adapter(
         out = out.to(output_dtype)
     return out
 
-
-SELF_INJECT_LABEL = {
-    "planner": "\nYour plan from the previous round:",
-    "critic":  "\nYour critique from the previous round:",
-    "solver":  "\nYour solution from the previous round:",
-}
 
 
 class _SelfInjectState:

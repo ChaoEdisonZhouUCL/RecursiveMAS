@@ -113,6 +113,7 @@ except ImportError:
     wandb = None
 
 from prompts import (
+    SELF_INJECT_LABEL,
     FEEDBACK_SLOT, PLANNER_SLOT, REFINED_SLOT,
     build_math_planner_prompt,
     build_math_planner_prompt_with_feedback_slot,
@@ -519,6 +520,70 @@ def build_solver_prompt(question: str) -> Tuple[str, str]:
     return pre, post
 
 
+class _TrainSelfInject:
+    """Each agent's own previous-round latent thought, for ``--self_inject``.
+
+    Under pipeline parallelism every agent lives on its own rank, and an agent
+    only ever re-reads *itself*, so this store is rank-local by construction --
+    no cross-rank communication is needed for the short path.
+
+    ``keep_grad`` decides what the path actually is.  Detached (the default) the
+    injection is a *forward* change only: the agent sees its previous thought and
+    the link parameters adapt to that, but no gradient crosses the round boundary
+    through it.  With ``keep_grad`` the injected block stays in the autograd graph
+    and the round boundary gains an ungated gradient path -- see the note in the
+    backward loop about what that costs.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self.keep_grad = False
+        self._prev: Dict[str, torch.Tensor] = {}
+        self._cur: Dict[str, torch.Tensor] = {}
+
+    def get(self, role: str) -> Optional[torch.Tensor]:
+        return self._prev.get(role) if self.enabled else None
+
+    def record(self, role: str, h: torch.Tensor) -> None:
+        if self.enabled:
+            self._cur[role] = h if self.keep_grad else h.detach()
+
+    def commit(self) -> None:
+        """Promote this round's thoughts to be next round's injection."""
+        if self.enabled:
+            self._prev, self._cur = self._cur, {}
+
+    def reset(self) -> None:
+        """Drop everything.  MUST run per micro-batch: the questions change but
+        the shapes do not, so a stale block would splice one micro-batch's
+        thoughts into another's round 0 without ever raising."""
+        self._prev.clear()
+        self._cur.clear()
+
+
+SELF_INJECT = _TrainSelfInject()
+
+
+def _self_inject_block(tokenizer, embed_fn, role: str, B: int,
+                       device: torch.device, dtype: torch.dtype):
+    """``[label tokens][own previous-round latents]``, or None when disabled.
+
+    Returns None at round 0 (nothing recorded yet), which is what makes the
+    first round identical to the control arm.
+    """
+    block = SELF_INJECT.get(role)
+    if block is None:
+        return None
+    if block.size(0) != B:          # micro-batch boundary; refuse to mix samples
+        return None
+    ids = tokenizer(SELF_INJECT_LABEL[role], return_tensors="pt",
+                    add_special_tokens=False).to(device)["input_ids"]
+    with torch.no_grad():
+        lab = embed_fn(ids).to(dtype)              # (1, T_lab, d)
+    lab = lab.expand(B, -1, -1)                    # (B, T_lab, d)
+    return torch.cat([lab, block.to(device=device, dtype=dtype)], dim=1)
+
+
 def _build_input_embeds(tokenizer, embed_fn, pre: str, post: str,
                         latent: Optional[torch.Tensor],
                         device: torch.device, dtype: torch.dtype):
@@ -536,13 +601,19 @@ def _build_input_embeds_batch(
     pre_list: List[str], post_list: List[str],
     latent: Optional[torch.Tensor],   # (B, L_lat, d) or None
     device: torch.device, dtype: torch.dtype,
+    self_inject: Optional[torch.Tensor] = None,   # (B, L_si, d) or None
 ):
     """
     Batched version: tokenize B (pre, post) pairs, inject the shared latent block
     (same L_lat for every sample — it comes from a fixed latent_steps rollout),
     and left-pad all sequences to the same length.
 
-    Layout per sample:  [PAD...] [pre tokens] [latent] [post tokens]
+    Layout per sample:  [PAD...] [pre tokens] [latent] [self_inject] [post tokens]
+
+    ``self_inject`` is this agent's own previous-round latent thought, already
+    prefixed with its role label.  It sits between the incoming latent and the
+    post text -- the same position the inference path splices it into -- so a
+    checkpoint trained with it can be evaluated with ``--self_inject`` unchanged.
     Padding is on the left so that the last real token is always at position -1,
     which matches how decoder-only models handle variable-length prefixes.
 
@@ -578,19 +649,24 @@ def _build_input_embeds_batch(
         pieces.append((emb_pre, enc_pre["attention_mask"], emb_post, am_post))
 
     L_lat = latent.size(1) if latent is not None else 0
+    L_si  = self_inject.size(1) if self_inject is not None else 0
 
     # Build unpadded sequences and find max length.
     seqs_emb = []
     seqs_am  = []
     for i, (emb_pre, am_pre, emb_post, am_post) in enumerate(pieces):
-        ones_lat = am_pre.new_ones((1, L_lat)) if L_lat > 0 else am_pre.new_zeros((1, 0))
+        parts_e = [emb_pre]
+        parts_a = [am_pre]
         if latent is not None:
-            lat_i = latent[i:i+1].to(dtype)   # (1, L_lat, d)
-            emb = torch.cat([emb_pre, lat_i, emb_post], dim=1)
-            am  = torch.cat([am_pre,  ones_lat, am_post],  dim=1)
-        else:
-            emb = torch.cat([emb_pre, emb_post], dim=1)
-            am  = torch.cat([am_pre,  am_post],  dim=1)
+            parts_e.append(latent[i:i+1].to(dtype))          # (1, L_lat, d)
+            parts_a.append(am_pre.new_ones((1, L_lat)))
+        if self_inject is not None:
+            parts_e.append(self_inject[i:i+1].to(dtype))     # (1, L_si, d)
+            parts_a.append(am_pre.new_ones((1, L_si)))
+        parts_e.append(emb_post)
+        parts_a.append(am_post)
+        emb = torch.cat(parts_e, dim=1)
+        am  = torch.cat(parts_a, dim=1)
         seqs_emb.append(emb[0])   # (T_i, d)
         seqs_am.append(am[0])     # (T_i,)
 
@@ -620,6 +696,7 @@ def _build_teacher_forced_batch(
     latent: Optional[torch.Tensor],   # (B, L_lat, d) or None
     answers: List[str],
     device: torch.device, dtype: torch.dtype,
+    self_inject: Optional[torch.Tensor] = None,   # (B, L_si, d) or None
 ):
     """
     Like _build_input_embeds_batch, but additionally appends each sample's
@@ -641,6 +718,7 @@ def _build_teacher_forced_batch(
     """
     ie_prompt, am_prompt = _build_input_embeds_batch(
         tokenizer, embed_fn, pre_list, post_list, latent, device, dtype,
+        self_inject=self_inject,
     )
     B, T_prompt_max, d_model = ie_prompt.shape
     pad_id = tokenizer.pad_token_id
@@ -1027,13 +1105,17 @@ def forward_one_round(
         else:
             pre_list  = [build_planner_feedback_prompt(q)[0] for q in questions]
             post_list = [build_planner_feedback_prompt(q)[1] for q in questions]
+        _si = _self_inject_block(planner_tok, planner_mdl.get_input_embeddings(),
+                                 "planner", B, device, dtype)
         ie, am = _build_input_embeds_batch(
             planner_tok, planner_mdl.get_input_embeddings(),
             pre_list, post_list, feedback_prefix, device, dtype,
+            self_inject=_si,
         )
         planner_h, _, _ = latent_rollout(planner_mdl, planner_inner, ie, am, latent_steps, dtype,
                                          agent_idx=1, shared_link=shared_link)
         del ie, am   # free prompt embeddings; only planner_h is needed going forward
+        SELF_INJECT.record("planner", planner_h)
         if shared_link is not None:
             critic_prefix = shared_link(planner_h, src=1, dst=2)
         else:
@@ -1059,13 +1141,17 @@ def forward_one_round(
     if rank == rc:
         pre_c_list  = [build_critic_prompt(q)[0] for q in questions]
         post_c_list = [build_critic_prompt(q)[1] for q in questions]
+        _si = _self_inject_block(critic_tok, critic_mdl.get_input_embeddings(),
+                                 "critic", B, device, dtype)
         critic_input, critic_am = _build_input_embeds_batch(
             critic_tok, critic_mdl.get_input_embeddings(),
             pre_c_list, post_c_list, critic_prefix, device, dtype,
+            self_inject=_si,
         )
         critic_h, _, _ = latent_rollout(critic_mdl, critic_inner, critic_input, critic_am,
                                         latent_steps, dtype, agent_idx=2, shared_link=shared_link)
         del critic_input, critic_am   # free prompt embeddings
+        SELF_INJECT.record("critic", critic_h)
         if shared_link is not None:
             solver_prefix = shared_link(critic_h, src=2, dst=3)
         else:
@@ -1093,11 +1179,14 @@ def forward_one_round(
     if rank == rs:
         pre_s_list  = [build_solver_prompt(q)[0] for q in questions]
         post_s_list = [build_solver_prompt(q)[1] for q in questions]
+        _si = _self_inject_block(solver_tok, solver_mdl.get_input_embeddings(),
+                                 "solver", B, device, dtype)
 
         if is_last_round:
             solver_input, solver_am, labels, T_prompt = _build_teacher_forced_batch(
                 solver_tok, solver_mdl.get_input_embeddings(),
                 pre_s_list, post_s_list, solver_prefix, answers, device, dtype,
+                self_inject=_si,
             )
             A_max = labels.shape[1] - T_prompt   # number of answer columns
 
@@ -1150,12 +1239,14 @@ def forward_one_round(
             solver_input, solver_am = _build_input_embeds_batch(
                 solver_tok, solver_mdl.get_input_embeddings(),
                 pre_s_list, post_s_list, solver_prefix, device, dtype,
+                self_inject=_si,
             )
             solver_h, _, _ = latent_rollout(
                 solver_mdl, solver_inner, solver_input, solver_am, latent_steps, dtype,
                 agent_idx=3, shared_link=shared_link,
             )
             del solver_input, solver_am   # free prompt embeddings before outer link
+            SELF_INJECT.record("solver", solver_h)
             if isinstance(shared_link, SharedRecursiveStateLink):
                 # shared_state: residual recursive state bypasses the full round —
                 # z' = z + gamma * F(z); the planner prefix is out_proj[1](z').
@@ -1416,6 +1507,9 @@ def eval_probe(
     with torch.no_grad():
         feedback_prefix = None
         round_state = None
+        # The probe is its own rollout: without this it would open round 0 with
+        # whatever the last training micro-batch happened to leave behind.
+        SELF_INJECT.reset()
         for r in range(n_rounds):
             out = forward_one_round(
                 planner_mdl, planner_tok, planner_inner,
@@ -1435,6 +1529,7 @@ def eval_probe(
                 keep_solver_logits=True,   # eval_probe needs logits to decode
                 round_state=round_state,
             )
+            SELF_INJECT.commit()
             if rank == rs:
                 round_state = out.get("round_state", round_state)
             if r < n_rounds - 1:
@@ -1450,6 +1545,8 @@ def eval_probe(
                         )
                 else:
                     feedback_prefix = out.get("feedback")
+
+        SELF_INJECT.reset()
 
         if rank == rs and solver_mdl is not None:
             solver_logits = out.get("solver_logits")
@@ -1498,10 +1595,20 @@ def run_training(cfg, device: torch.device, mode: str = "original",
     _link_dtype_name = getattr(cfg, "link_dtype", "float32")
     link_dtype = dtype if _link_dtype_name == "same" else _dtype_map[_link_dtype_name]
 
+    # Self-injection: each agent re-reads its own previous-round latent thought.
+    SELF_INJECT.enabled   = bool(getattr(cfg, "self_inject", False))
+    SELF_INJECT.keep_grad = bool(getattr(cfg, "self_inject_grad", False))
+    if SELF_INJECT.keep_grad and not SELF_INJECT.enabled:
+        raise SystemExit("--self_inject_grad requires --self_inject")
+
     if rank == 0:
         skip_tag = "" if use_round_skip else "  round_skip=OFF"
         print(f"\nDevice: {device}  |  world={world}  |  n_rounds={cfg.n_rounds}"
               f"  latent_steps={cfg.latent_steps}  steps={cfg.steps}  mode={mode}{skip_tag}")
+        if SELF_INJECT.enabled:
+            _g = "grad (short path)" if SELF_INJECT.keep_grad else "detached (forward only)"
+            print(f"[self_inject] ON  -  each agent re-reads its own previous-round "
+                  f"latents; round 0 injects nothing; block is {_g}")
 
     # ── Load models: each rank loads only what it owns ───────────────────────
     rp = _pipeline_rank("planner")
@@ -1896,6 +2003,11 @@ def run_training(cfg, device: torch.device, mode: str = "original",
             if isinstance(shared_link, SharedRecursiveStateLink):
                 shared_link.write_log.clear()
 
+            # Same reasoning as write_log: the self-inject store is per-rollout.
+            # Micro-batches share every shape, so a leftover block would splice
+            # the previous micro-batch's thoughts into this one's round 0.
+            SELF_INJECT.reset()
+
             # ── Sample a micro-batch of B problems ───────────────────────────
             idxs      = rng.integers(len(problems), size=B)
             questions = [problems[i][0] for i in idxs]
@@ -1930,6 +2042,8 @@ def run_training(cfg, device: torch.device, mode: str = "original",
                     round_state=round_state,
                 )
                 rounds.append(out)
+                # Promote this round's thoughts before the next round reads them.
+                SELF_INJECT.commit()
                 if rank == rs:
                     round_state = out.get("round_state", round_state)
 
@@ -2877,6 +2991,22 @@ def parse_args():
                         "per-stage round1/round2 gradient ratio equals 1/gamma.  The "
                         "ReZero default (1e-3) admits later rounds at 0.1% strength in "
                         "the forward pass as well as the backward one.")
+    p.add_argument("--self_inject", action="store_true", default=False,
+                   help="Splice each agent's OWN previous-round latent thought into its "
+                        "prompt, behind a role-specific label.  Round 0 injects nothing. "
+                        "Information enters by occupying new positions rather than being "
+                        "scaled into the recursive state, so it bypasses the gamma write "
+                        "gate entirely.  Self-injection is dimension-matched by "
+                        "construction (agent i reads agent i), so this adds no parameters. "
+                        "Matches the inference-side --self_inject layout exactly.")
+    p.add_argument("--self_inject_grad", action="store_true", default=False,
+                   help="Keep the injected block in the autograd graph, turning the "
+                        "short path into a gradient path across the round boundary. "
+                        "Default is detached (a forward-only change).  NOTE: this "
+                        "breaks the per-round gradient attribution the GradMonitor "
+                        "reports, because round r's backward then also reaches round "
+                        "r-1's activations -- the totals stay correct, the per-round "
+                        "split does not.  Requires --self_inject.")
     p.add_argument("--no_round_skip", action="store_true", default=False,
                    help="Disable the round-skip gate (beta=0, frozen) in shared_roae mode.")
     p.add_argument("--n_ckpt", type=int, default=1,

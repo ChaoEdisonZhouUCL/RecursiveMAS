@@ -11,6 +11,17 @@ PLANNER_SLOT = "<<LATENT_PLANNER_SLOT>>"
 REFINED_SLOT = "<<LATENT_REFINED_SLOT>>"
 FEEDBACK_SLOT = "<<LATENT_FEEDBACK_SLOT>>"
 
+# Role-specific header for the self-injected latent block (``--self_inject``).
+# Each agent re-reads its OWN previous-round latent thought, so the label names
+# that agent's own artefact.  Defined here rather than in either consumer so the
+# training and inference paths cannot drift apart -- a mismatch would silently
+# invalidate any train/eval comparison.
+SELF_INJECT_LABEL = {
+    "planner": "\nYour plan from the previous round:",
+    "critic":  "\nYour critique from the previous round:",
+    "solver":  "\nYour solution from the previous round:",
+}
+
 HIE_MATH_EXPERT_SLOT = "<<HIE_MATH_EXPERT_SLOT>>"
 HIE_CODE_EXPERT_SLOT = "<<HIE_CODE_EXPERT_SLOT>>"
 HIE_SCIENCE_EXPERT_SLOT = "<<HIE_SCIENCE_EXPERT_SLOT>>"

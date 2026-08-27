@@ -71,6 +71,10 @@ Training options:
   --gamma_init F          Initial recursive-state write gate      (default: 1e-3)
   --no_kv_cache           Disable KV cache in latent rollout      (required for latent_steps>=20)
   --no_round_skip         Disable round-skip gate (beta=0, frozen); shared_roae mode only
+  --train_self_inject     Train with each agent re-reading its own previous-round latent
+                          thought (round 0 injects nothing).  Bypasses the gamma write gate.
+  --train_self_inject_grad  As above, but the injected block stays in the autograd graph,
+                          making the short path a gradient path.  Implies --train_self_inject.
   --dataset NAME          math500 | s1k | m1k | s1k+m1k (pooled)  (default: math500)
   --max_seq_len N         Max combined Q+A length in tokens (0=off) (default: 0)
   --n_samples N           Training problems per epoch (0=full dataset) (default: 500)
@@ -151,6 +155,8 @@ while [[ $# -gt 0 ]]; do
         --n_experts)          N_EXPERTS="$2";          shift 2 ;;
         --expert_dim_divisor) EXPERT_DIM_DIVISOR="$2"; shift 2 ;;
         --gamma_init)         GAMMA_INIT="$2";         shift 2 ;;
+        --train_self_inject)  TRAIN_SELF_INJECT=true;  shift ;;
+        --train_self_inject_grad) TRAIN_SELF_INJECT=true; TRAIN_SELF_INJECT_GRAD=true; shift ;;
         --no_kv_cache)        NO_KV_CACHE=true;        shift ;;
         --no_round_skip)      USE_ROUND_SKIP=false;    shift ;;
         --n_ckpt)             N_CKPT="$2";             shift 2 ;;
@@ -313,6 +319,8 @@ else
     --n_ckpt ${N_CKPT}"
     [[ "${NO_KV_CACHE}" == "true" ]]      && TRAIN_CMD="${TRAIN_CMD} --no_kv_cache"
     [[ "${USE_ROUND_SKIP}" == "false" ]]  && TRAIN_CMD="${TRAIN_CMD} --no_round_skip"
+    [[ "${TRAIN_SELF_INJECT}" == "true" ]]      && TRAIN_CMD="${TRAIN_CMD} --self_inject"
+    [[ "${TRAIN_SELF_INJECT_GRAD}" == "true" ]] && TRAIN_CMD="${TRAIN_CMD} --self_inject_grad"
     [[ -n "${RESUME_CKPT}" ]]             && TRAIN_CMD="${TRAIN_CMD} --resume_ckpt ${RESUME_CKPT}"
     [[ "${GRAD_CHECKPOINT}" == "true" ]]  && TRAIN_CMD="${TRAIN_CMD} --grad_checkpoint"
     [[ "${GRAD_ACCUM}" -gt 1 ]] 2>/dev/null && TRAIN_CMD="${TRAIN_CMD} --grad_accum ${GRAD_ACCUM}"

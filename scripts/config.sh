@@ -72,6 +72,13 @@ EXPERT_DIM_DIVISOR=3
 # so this sets how strongly rounds after the first write into the state -- and
 # the per-stage round1/round2 gradient ratio is 1/GAMMA_INIT.
 GAMMA_INIT="1e-3"
+
+# Train with self-injection: each agent re-reads its own previous-round latent
+# thought, spliced into its prompt behind a role-specific label.  Round 0 injects
+# nothing.  TRAIN_SELF_INJECT_GRAD additionally keeps that block in the autograd
+# graph (a gradient short path across the round boundary); it implies the former.
+TRAIN_SELF_INJECT=false
+TRAIN_SELF_INJECT_GRAD=false
 NO_KV_CACHE=false          # set true when latent_steps >= 20 (paper uses 80)
 DATASET="s1k+m1k+opencodereasoning+arpo_sft"          # math500 | s1k | m1k | opencodereasoning | arpo_sft | s1k+m1k+opencodereasoning+arpo_sft (pooled)
 MAX_SEQ_LEN=4096              # max combined question+answer length in tokens (0 = no truncation)
