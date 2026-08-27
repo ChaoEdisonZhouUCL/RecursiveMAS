@@ -71,6 +71,11 @@ Training options:
   --gamma_init F          Initial recursive-state write gate      (default: 1e-3)
   --no_kv_cache           Disable KV cache in latent rollout      (required for latent_steps>=20)
   --no_round_skip         Disable round-skip gate (beta=0, frozen); shared_roae mode only
+  --out_prefix NAME       Checkpoint directory prefix (default: outerlink_grad).  Set this
+                          when launching arms in parallel: the directory name is
+                          <prefix>_<mode>_r<N>_<timestamp>, and the timestamp is taken
+                          when the job STARTS, so two arms starting in the same second
+                          would otherwise share a directory and overwrite each other.
   --train_self_inject     Train with each agent re-reading its own previous-round latent
                           thought (round 0 injects nothing).  Bypasses the gamma write gate.
   --train_self_inject_grad  As above, but the injected block stays in the autograd graph,
@@ -155,6 +160,7 @@ while [[ $# -gt 0 ]]; do
         --n_experts)          N_EXPERTS="$2";          shift 2 ;;
         --expert_dim_divisor) EXPERT_DIM_DIVISOR="$2"; shift 2 ;;
         --gamma_init)         GAMMA_INIT="$2";         shift 2 ;;
+        --out_prefix)         OUT_PREFIX="$2";         shift 2 ;;
         --train_self_inject)  TRAIN_SELF_INJECT=true;  shift ;;
         --train_self_inject_grad) TRAIN_SELF_INJECT=true; TRAIN_SELF_INJECT_GRAD=true; shift ;;
         --no_kv_cache)        NO_KV_CACHE=true;        shift ;;
@@ -313,6 +319,7 @@ else
     --n_experts ${N_EXPERTS} \
     --expert_dim_divisor ${EXPERT_DIM_DIVISOR} \
     --gamma_init ${GAMMA_INIT} \
+    --out_prefix ${OUT_PREFIX} \
     --dataset ${DATASET} \
     --max_seq_len ${MAX_SEQ_LEN} \
     --n_samples ${N_SAMPLES} \

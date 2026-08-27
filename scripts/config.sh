@@ -77,6 +77,12 @@ GAMMA_INIT="1e-3"
 # thought, spliced into its prompt behind a role-specific label.  Round 0 injects
 # nothing.  TRAIN_SELF_INJECT_GRAD additionally keeps that block in the autograd
 # graph (a gradient short path across the round boundary); it implies the former.
+# Checkpoint directory prefix.  The run directory is
+# <OUT_PREFIX>_<MODE>_r<N>[_noskip]_<timestamp>, and the timestamp is generated when
+# the job starts -- so arms launched together must use distinct prefixes or they can
+# land in the same directory.
+OUT_PREFIX="outerlink_grad"
+
 TRAIN_SELF_INJECT=false
 TRAIN_SELF_INJECT_GRAD=false
 NO_KV_CACHE=false          # set true when latent_steps >= 20 (paper uses 80)
